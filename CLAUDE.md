@@ -199,6 +199,8 @@ This applies even when the current task is otherwise complete — capture the fo
 | `DBB_DUMP_MAX_SIZE` | Max dump file size per session in bytes (default: 10MB) | No |
 | `DBB_DUMP_RETENTION` | Auto-delete dumps older than this (default: `24h`). Applies to the **local spool only** — dbbat never expires objects it uploaded | No |
 | `DBB_DUMP_UPLOAD_URL` | Blob bucket finished captures are uploaded to on session close, e.g. `s3://bucket/prefix` (also `file://`, `gs://`, `azblob://` via `gocloud.dev/blob`). Empty = local disk only, the default. Requires `DBB_DUMP_DIR`, which becomes the spool: captures are always written locally and uploaded once complete, never streamed live. Object key `<prefix>/YYYY/MM/DD/<instance-id>/<connection-uid>.pcapng`, recorded on the connection row so downloads never LIST the bucket. Remote retention is the bucket lifecycle policy. See `docs/dump-format.md` | No |
+| `DBB_QUERY_TAGGING` | Prepend a [sqlcommenter](https://google.github.io/sqlcommenter/)-style comment — `/*dbbat='<version>',user='<user>',conn='<12hex>',grant='<definition-slug>'*/` — to every statement forwarded to the target, so the *target's* own tooling (RDS Performance Insights, `pg_stat_statements`, the slow log) can attribute it to a dbbat user/connection/grant rather than to the one shared role every session logs in as. **Off by default**: it changes the bytes the database receives. **PostgreSQL, MySQL/MariaDB and MongoDB** — on MongoDB there is no statement text to comment, so the same `dbbat='…',user='…',conn='…',grant='…'` string rides in the command's `comment` field (`find`, `aggregate`, `getMore`, `insert`, `update`, `delete`, … — an allowlist), where `system.profile`, the Atlas profiler and `db.currentOp()` echo it back; a **client-supplied `comment` wins** and that command is forwarded untouched, since the field is single-valued and a driver's own tracing may own it. Oracle has its own switch, `DBB_QUERY_TAGGING_ORACLE` (below), and this one deliberately does not reach it. SQL Server is a follow-up. Prepended rather than appended, because `pg_stat_activity.query` and the slow log truncate at the *end*. It carries no timestamp and no per-statement id, so repeated executions stay byte-identical and the digest keeps aggregating them. `conn=` is the same 12 hex characters as the app-name `c=` tag. Applied on the wire **only**: PG `Query` and `Parse` (once — every `Execute` inherits it), MySQL `COM_QUERY` and `COM_STMT_PREPARE` (`COM_STMT_EXECUTE` is binary and untouched), MongoDB the forwarded `OP_MSG` body. Every grant control, every bypass scan and every approval pattern runs on the **client's** text beforehand, and the `queries` table, the audit chain, the UI's text search and the `.pcapng` captures all store the client's text — the tag is reconstructible from the connection row, so it is never persisted. See `docs/postgresql.md`, `docs/mysql.md` and `docs/mongodb.md` | No |
+| `DBB_QUERY_TAGGING_ORACLE` | Oracle's own statement tag: `off` (default) or `user`. Separate from `DBB_QUERY_TAGGING` because the trade-off is Oracle's alone — `V$SQL` keys on statement text, so every distinct tag is a distinct SQL_ID holding its own shared-pool cursor. Measured on 23ai (600 executions of one join): a per-*connection* tag costs 200 cursors and 9.6MB for 200 sessions and has no ceiling; dropping `conn=` bounds it at one cursor per dbbat **user**, ~48KB and one hard parse each, then a flat plateau (a second 600 executions added zero loads and zero bytes). Hence `user` as the only non-off value, and `shared.NewUserQueryTagger`'s conn-less bytes. Anything else is a **startup failure**. Unlike the other three protocols, the Oracle proxy relays the client's own TNS packets, so turning this on does not oblige it to tag: `internal/proxy/oracle/ttc_statement_rewrite.go` rewrites a frame only when it can relocate the statement **to the byte** — the SQL-length field's offset, width and encoding (compressed int on the `03 5e`/`11 69` execs, `sqlLen*3` ub4 for OCI, `decodeVarLen` on OALL8), the value's span and its CLR framing (short, bare, or `0xFE`-chunked) — *and* re-encoding what it read reproduces the client's own bytes. Injected in `clientToUpstream` between the `blocked` check and the write loop, so the controls, the `queries` row, the audit chain and the capture have all already run on the client's text. **The decision is per session and taken once**: a client shape the locator cannot certify runs untagged start to finish and logs why, because a statement tagged on some executions and not others would get two SQL_IDs and double the cursor count the design exists to bound. 159/159 recorded frames in `testdata/` locate and round-trip; see `docs/oracle.md` | No |
 | `DBB_QUERY_STORAGE_RETENTION` | Auto-delete query history (and captured result rows) older than this Go duration. Default `0` = keep forever; `720h` (30 days) is a reasonable opt-in value. The **statement** window, and the one `store.Options.QueryRetention` is fed from | No |
 | `DBB_CONNECTION_RETENTION` | Auto-delete **closed** connections — the session ledger (who, from where, to which database, under which grant) — once `disconnected_at` is older than this Go duration, cascading to whatever queries and rows they still have. **Unset = inherit the query window**, so an upgrade sweeps exactly what it swept before; explicit `0` keeps the ledger forever while statements still expire, which is the point of the split. It must be **≥** the query window: a shorter one would delete statements sooner than configured, so it — like a value shorter than the query window, a malformed value on either side, or a non-zero value with queries kept forever — **disables both sweeps** with a startup WARN naming both values, never a startup failure. All four rules live in `config.Config.RetentionWindows()`. Note the object key of an uploaded capture lives on the connection row, so a ledger window shorter than the bucket lifecycle orphans those objects | No |
 | `DBB_MYSQL_TLS_DISABLE` | Refuse TLS upgrade on the MySQL listener (default: `false`) | No |
@@ -229,7 +231,10 @@ This applies even when the current task is otherwise complete — capture the fo
 | `DBB_SLACK_NOTIFY_CHANNEL` | Slack channel id or name for grant-request notifications (default: `#dbbat`) | No |
 | `DBB_SLACK_SIGNING_SECRET` | Slack app signing secret; enables Approve/Deny buttons + inbound interactions endpoint. Empty = link-through-UI (no buttons). Requires the bot token. Legacy alias `DBB_SLACK_NOTIFY_SIGNING_SECRET` is also accepted; the canonical name wins if both are set. | No |
 | `DBB_SLACK_NOTIFY_APP_TOKEN` | Slack app-level token (`xapp-...`, scope `connections:write`); enables **Socket Mode** — receives Approve/Deny clicks over an outbound WebSocket instead of the inbound endpoint (for deployments Slack can't reach inbound). Requires the bot token. | No |
+| `DBB_SLACK_NOTIFY_TERMINATIONS` | Post a Slack message when dbbat ends a session on its own for a reason worth a human's attention: `statement_timeout`, `admin_terminated`, `quota_exceeded` (never `grant_revoked` — already went through a human —, `grant_expired`, or `instance_lost`). Default `true`; only meaningful when `DBB_SLACK_NOTIFY_BOT_TOKEN` is set. Repeated terminations for the same (user, database, reason) within 10 minutes are coalesced into one follow-up rather than flooding the channel | No |
+| `DBB_SLACK_NOTIFY_SQL` | Include the (truncated, 200-char) statement text in a termination Slack message. Default `true`, mirrors `DBB_APPROVAL_SLACK_SQL` | No |
 | `DBB_PUBLIC_URL` | Externally reachable base URL; used for deep-links in Slack notifications | If notify enabled |
+| `DBB_STATEMENT_TIMEOUT` | Instance-wide per-statement time limit, as a Go duration (`30s`, `5m`). Empty or `0` — the default — means no limit, so an upgrade never starts cancelling statements on its own. It is the **lowest** of three layers: the operator-set `limits.statement_timeout` store parameter wins over it (the way `public.*` wins over `DBB_LISTEN_*`), and a grant definition's `statement_timeout_seconds` wins over both — including an explicit `0`, which is how a dump or ETL definition stays usable. A malformed value disables the limit with a startup WARN rather than shortening it. Enforcement is dbbat's own watchdog (`LimitGuard`, 250ms tick, `limit + 2s` grace); the server-side setting each protocol offers is only how the client learns *why*. See "Per-statement time limits" below | No |
 | `DBB_APPROVAL_ENABLED` | Enable pattern-triggered approval holds (four-eyes on a statement). **Off by default** — a hold blocks a live database connection on a human. See `docs/approvals.md` | No |
 | `DBB_APPROVAL_SLACK_DELAY` | How long a hold stays pending before escalating to Slack (default: `30s`; `0` disables) | No |
 | `DBB_APPROVAL_SLACK_SQL` | Include the (truncated) SQL text in the Slack escalation (default: `true`) | No |
@@ -378,6 +383,11 @@ The same auth + grant + query-logging pipeline runs across all five protocols (`
   and `priority` ranks group-bound grants against each other on the databases
   where their groups overlap. The auth path is one function,
   `store.GetActiveGrant`, which all five protocols share.
+- Optional **per-statement time limit** (`statement_timeout_seconds` on the
+  definition). Three states, and `0` is not "omitted": `NULL` inherits the
+  instance-wide default, `0` means explicitly **no limit, overriding that
+  default** (the escape hatch a dump or ETL definition needs), and a positive
+  value is the limit in seconds. See "Per-statement time limits" below
 - Optional **approval holds**: RE2 patterns on the definition that suspend a
   matching statement mid-flight until a second human approves it. Self-approval
   is always rejected; a hold has no timeout. Off by default
@@ -416,6 +426,103 @@ The same auth + grant + query-logging pipeline runs across all five protocols (`
   **Deactivating** a definition is different from that archival — it withdraws
   the whole lineage and fails closed at auth time; hard deletion is refused
   (409) while anything references it.
+
+### Per-statement time limits
+
+A grant bounds *time* (`expires_at`), *volume* (`max_query_counts`,
+`max_bytes_transferred`) and *shape* (`read_only`, `block_ddl`, `block_copy`,
+approval patterns). It also bounds a **single statement's duration**, which is
+what stops one investigation session from saturating a production replica.
+
+Resolution, per session at auth time: the grant definition's
+`statement_timeout_seconds` when it has one (`0` = no limit, overriding
+everything below), otherwise the `limits.statement_timeout` store parameter
+(Settings page), otherwise `DBB_STATEMENT_TIMEOUT`. One resolved value feeds
+both layers, so they cannot disagree.
+
+**Layer 1 — the server-side setting**, applied before the client is told it is
+connected, at the same point the read-only pin is. It is not the enforcement;
+it is how the client gets a real database error instead of a dropped socket. A
+session that cannot be pinned fails, same rule as `ErrUpstreamReadOnlyMode`.
+
+| Protocol | What is set | Notes |
+|---|---|---|
+| PostgreSQL | `SET SESSION statement_timeout` | SQLSTATE 57014, session survives |
+| MySQL | `SET SESSION max_execution_time` (ms) | Covers `SELECT` only; the watchdog covers the rest |
+| MariaDB | `SET SESSION max_statement_time` (s) | Detected from the version banner — neither server accepts the other's name |
+| MongoDB | `maxTimeMS` injected into each forwarded command | No session knob exists. A client value **at or below** the limit is kept; a larger one (or `0`) is clamped |
+| Oracle | nothing | A statement time limit is a Resource Manager plan (DBA-level); `CALL_TIMEOUT` is an OCI *client* setting |
+| SQL Server | nothing | The query timeout is a client concept |
+
+Because the limit is hard, a statement that would unset or widen it is refused
+with a clear error — PostgreSQL's `SET/RESET statement_timeout` and `RESET ALL`,
+MySQL's `SET max_execution_time` / `max_statement_time` and an over-limit
+`/*+ MAX_EXECUTION_TIME(n) */` hint. The refusal runs through the same
+`validateStatement` the grant controls do, so the simple and extended paths
+cannot drift. `SHOW statement_timeout` stays allowed: reading the limit is the
+opposite of bypassing it. On MongoDB an over-limit `maxTimeMS` is clamped, not
+refused — it is an ordinary per-command option, not a `SET`.
+
+**Layer 2 — dbbat's watchdog**, which is the actual enforcement. The per-session
+`LimitGuard` carries a `StatementClock` marking when the **oldest** statement
+still executing upstream was forwarded, and trips `ErrStatementTimeout` once
+that passes `limit + StatementTimeoutGrace` (2s, a constant, not a setting). The
+250ms poll means the kill lands within 2.25s of the limit. **Time parked on an
+approval hold does not count**: the clock starts when the statement is actually
+sent upstream, which a held statement has not been — and the server-side
+settings agree by construction, having never seen it.
+
+On a trip, in this order: **cancel upstream, then close both sockets**. Closing
+alone is not enough — a PostgreSQL backend in a long sequential scan does not
+notice a dead client until it next tries to send, and
+`client_connection_check_interval` defaults to `0`. Per protocol: PostgreSQL a
+`CancelRequest` on a fresh connection through the same dial path (SSH /
+Kubernetes tunnels included); MySQL `KILL QUERY <upstream connection id>`,
+likewise on a fresh connection; SQL Server a TDS ATTENTION on the existing
+connection; Oracle a break/reset marker exchange (**unverified against a real
+server** — the socket close is the guarantee, see `docs/oracle.md`); MongoDB
+nothing, because the injected `maxTimeMS` already is the cancel and `killOp`
+needs privileges the proxied role usually lacks.
+
+Every dbbat-initiated teardown is recorded rather than merely logged:
+`connections.termination_reason` (`statement_timeout`, `grant_expired`,
+`quota_exceeded`, `grant_revoked`, `admin_terminated`, `instance_lost`) written
+in the same statement as `disconnected_at`, a chained `connection.terminated`
+audit entry carrying the statement, the limit and the observed duration, a
+`connection` stream event with state `terminated`, and the in-flight query row
+completed with `statement timeout: limit 30s, ran 32.1s, session terminated by
+dbbat`. MCP agents get the same limit named in the tool error rather than an
+opaque driver failure (`docs/mcp.md`). `instance_lost` is the odd one out — no
+session wrote it, the crash reconcile did, so the column has no unexplained
+NULLs on closed rows.
+
+**Ending one live session**: `POST /api/v1/connections/{uid}/terminate`, admin
+only, 202/404/409 (`POST` on a sub-path, never `DELETE /connections/{uid}` —
+that reads as deleting the ledger row, which retention owns and the audit chain
+protects). Terminating is not revoking: the grant is untouched and the user may
+reconnect immediately.
+
+The replica serving the API call is not necessarily the one serving the session
+(`connections.run_id` says who is), so the request is a **row** —
+`terminate_requested_at` / `_by` / `terminate_reason`, partial-indexed on
+`(run_id)` — and every process polls for its own every
+`store.TerminationPollInterval` (2s, on the instance-heartbeat goroutine). When
+the API replica *does* own the session it signals `cache.SessionRegistry`
+directly, so the local case stays instant. The registry is keyed by connection
+uid, sits next to `cache.RevocationRegistry`, and its flag is attached to the
+session's `LimitGuard` (`WithTermination`) exactly as revocation is — so
+`Check()` returns `ErrAdminTerminated` and the existing `onLimitViolation`
+teardown runs unchanged.
+
+**The poll has a second arm, and it fixes a bug rather than adding a feature.**
+`DELETE /grants/{uid}` only ever signalled the in-process `RevocationRegistry`,
+so in a multi-replica deployment revoking a grant ended the sessions on the
+replica that served the API call and left every other one running until it
+expired (`GetActiveGrant` runs only at connect; `LimitGuard` compares
+`expires_at`, never `revoked_at`). The second arm selects this run's live
+sessions whose grant carries `revoked_at`, signals them through the same handle,
+and records `grant_revoked` — the handle's reason is authoritative over the
+sentinel, which is what keeps the two apart.
 
 ### Security
 - User passwords: Argon2id hashed

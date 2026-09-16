@@ -13,6 +13,7 @@ import (
 	"github.com/fclairamb/dbbat/internal/crypto"
 	"github.com/fclairamb/dbbat/internal/proxy/shared"
 	"github.com/fclairamb/dbbat/internal/store"
+	"github.com/fclairamb/dbbat/internal/version"
 )
 
 // newGoMySQLServer builds the shared go-mysql server config.
@@ -225,8 +226,25 @@ func (h *dbbatAuthHandler) OnAuthSuccess(_ *gomysqlserver.Conn) error {
 	// Build the limit guard now that the grant is known. The command loop's
 	// watchdog (started in Run) uses it to terminate the session mid-query,
 	// including when the grant is revoked.
+	// Resolve the per-statement limit once, next to the grant it comes from:
+	// the definition's value when it has one (0 included, meaning "no limit,
+	// overriding the global"), otherwise the instance-wide default. The
+	// upstream SET and the watchdog both read this one resolved value.
+	s.statementLimit = s.server.statementTimeouts.For(s.ctx, grant)
+
 	s.guard = shared.NewLimitGuard(grant, s.bytesFromClient, s.bytesToClient).
-		WithRevocation(s.revocation.Flag())
+		WithRevocation(s.revocation.Flag()).
+		WithStatementTimeout(s.statementLimit, shared.StatementTimeoutGrace, &s.statementClock)
+
+	// The statement tag, built once, here, because every component of it is
+	// known exactly now and none of them changes for the rest of the session —
+	// which is what keeps repeated executions of one statement byte-identical
+	// and the MySQL digest aggregating them. Left at its inert zero value when
+	// DBB_QUERY_TAGGING is off.
+	if s.server.queryTagging.Load() {
+		s.queryTag = shared.NewQueryTagger(
+			version.Version, s.user.Username, s.connUID, grant.DefinitionSlug())
+	}
 
 	s.authComplete = true
 

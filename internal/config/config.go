@@ -670,6 +670,15 @@ type SlackNotifyConfig struct {
 	// deployments that can't accept inbound Slack traffic. Empty = no Socket
 	// Mode.
 	AppToken string `koanf:"app_token"`
+	// Terminations posts a message for every connection.terminated whose
+	// reason is worth a human's attention (statement_timeout,
+	// admin_terminated, quota_exceeded — never grant_revoked, grant_expired
+	// or instance_lost). Only meaningful when BotToken is set. Default true.
+	Terminations bool `koanf:"terminations"`
+	// SQL includes the (truncated) statement text of a terminated session in
+	// the Slack message. Mirrors ApprovalConfig.SlackSQL: Slack is a lower
+	// trust boundary than the dbbat UI. Default true.
+	SQL bool `koanf:"sql"`
 }
 
 // Enabled returns true when a bot token is set. Channel is enforced at
@@ -946,6 +955,9 @@ type Config struct {
 	// Connection holds the session-ledger settings, retention above all.
 	Connection ConnectionConfig `koanf:"connection"`
 
+	// QueryTagging holds the sqlcommenter-style statement tagging settings.
+	QueryTagging QueryTaggingConfig `koanf:"query_tagging"`
+
 	// RateLimit holds rate limiting configuration.
 	RateLimit RateLimitConfig `koanf:"rate_limit"`
 
@@ -985,6 +997,22 @@ type Config struct {
 	// only if SlackNotify is enabled.
 	PublicURL string `koanf:"public_url"`
 
+	// StatementTimeout is the deployment's default per-statement time limit,
+	// as a Go duration ("30s", "5m"). Empty or "0" — the default — means no
+	// instance-wide limit, so an upgrade never starts canceling statements
+	// on its own.
+	//
+	// It is the *lowest* of the three layers: the operator-set
+	// limits.statement_timeout store parameter wins over it (the same way
+	// public.* wins over DBB_LISTEN_*), and a grant definition's own
+	// statement_timeout_seconds wins over both — including an explicit 0,
+	// which is how a dump or ETL definition stays usable.
+	//
+	// A malformed value reads as "no limit" rather than as some built-in
+	// default: this setting kills live database sessions, so a typo must
+	// never mean "kill sooner". Load warns about it.
+	StatementTimeout string `koanf:"statement_timeout"`
+
 	// Dump holds session packet dump configuration.
 	Dump DumpConfig `koanf:"dump"`
 
@@ -1005,6 +1033,79 @@ type Config struct {
 
 	// MCP holds the Model Context Protocol endpoint configuration.
 	MCP MCPConfig `koanf:"mcp"`
+}
+
+// QueryTaggingConfig configures the sqlcommenter-style comment dbbat prepends
+// to every statement it forwards, so the *target's* own tooling — RDS
+// Performance Insights, pg_stat_statements, the slow query log — can attribute
+// a statement to the dbbat user, connection and grant rather than to the
+// shared database role every session logs in as.
+//
+// Enabled defaults to **false**, deliberately. This changes the bytes the
+// database receives, and a deployment that pins statement text (a
+// pg_stat_statements allowlist, a query firewall, a per-statement cache) has
+// to turn it on knowingly.
+type QueryTaggingConfig struct {
+	// Enabled prepends the tag on the PostgreSQL, MySQL/MariaDB and MongoDB
+	// proxies (MongoDB puts it in the commands' `comment` field rather than in
+	// a SQL comment). It does **not** reach Oracle, which has its own setting
+	// below, or SQL Server, which has none yet.
+	Enabled bool `koanf:"enabled"`
+
+	// Oracle is Oracle's own switch, deliberately not folded into Enabled.
+	//
+	// V$SQL keys on statement text, so every distinct tag is a distinct
+	// SQL_ID: the tag buys attribution by spending shared-pool cursors. That
+	// trade-off is Oracle's alone, and an operator who turned tagging on for
+	// PostgreSQL did not consent to it — hence a separate variable, off by
+	// default even when Enabled is true.
+	//
+	// The only non-off value is "user": the tag carries the dbbat version, the
+	// user and the grant, and **omits `conn=`**, so the cursor count is bounded
+	// by the number of dbbat *users* rather than growing with every session.
+	// Measured on Oracle 23ai Free with one join executed 600 times: 20 tagged
+	// identities cost 20 cursors, 20 one-time hard parses and ~48KB of
+	// SHARABLE_MEM each, and then plateau — a second 600-execution pass added
+	// zero loads, zero library-cache misses and zero bytes. The same traffic
+	// under a per-connection tag cost 200 cursors and 9.6MB, with no ceiling.
+	//
+	// Turning it on does not oblige the proxy to tag: Oracle relays the
+	// client's own TNS packets, so a statement can only carry the tag when the
+	// exact locator can relocate it in the frame *and* re-encode that frame to
+	// the client's own bytes. A session whose client shape it cannot certify
+	// runs untagged start to finish and logs why. See docs/oracle.md.
+	Oracle string `koanf:"oracle"`
+}
+
+// Oracle statement-tagging modes.
+const (
+	// QueryTaggingOracleOff forwards Oracle statements byte-for-byte. The
+	// default, and what an empty value means.
+	QueryTaggingOracleOff = "off"
+	// QueryTaggingOracleUser tags with the dbbat version, user and grant, and
+	// no per-connection component.
+	QueryTaggingOracleUser = "user"
+)
+
+// ErrQueryTaggingOracleInvalid is returned when DBB_QUERY_TAGGING_ORACLE holds
+// something other than "off" or "user". Like the TLS ceiling above it fails the
+// process at startup rather than falling back: an operator who asked for
+// attribution on their Oracle fleet and silently got none would have no way to
+// tell, since the absence of a tag looks exactly like the feature being off.
+var ErrQueryTaggingOracleInvalid = errors.New(
+	`invalid DBB_QUERY_TAGGING_ORACLE: want "off" or "user"`)
+
+// ResolveOracle validates Oracle and reports whether the per-user tag is on.
+// An empty value resolves to QueryTaggingOracleOff.
+func (c QueryTaggingConfig) ResolveOracle() (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(c.Oracle)) {
+	case "", QueryTaggingOracleOff:
+		return false, nil
+	case QueryTaggingOracleUser:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: got %q", ErrQueryTaggingOracleInvalid, c.Oracle)
+	}
 }
 
 // MCPConfig configures the Model Context Protocol endpoint that lets AI
@@ -1059,6 +1160,34 @@ const (
 	defaultKeyDirPerm  = 0o700
 	defaultKeyFilePerm = 0o600
 )
+
+// StatementTimeoutDuration parses StatementTimeout into a duration. Zero means
+// "no instance-wide limit", which is also what a malformed value resolves to —
+// see the field doc for why a typo must never shorten the limit.
+func (c *Config) StatementTimeoutDuration() time.Duration {
+	if c == nil {
+		return 0
+	}
+
+	d, err := time.ParseDuration(c.StatementTimeout)
+	if err != nil || d <= 0 {
+		return 0
+	}
+
+	return d
+}
+
+// StatementTimeoutMisconfigured reports that StatementTimeout was set to
+// something that is neither empty nor "0" nor a usable positive duration — i.e.
+// the limit silently ends up disabled and the operator probably did not mean
+// that. Same contract as QueryStorageConfig.RetentionMisconfigured.
+func (c *Config) StatementTimeoutMisconfigured() bool {
+	if c == nil {
+		return false
+	}
+
+	return c.StatementTimeout != "" && c.StatementTimeout != "0" && c.StatementTimeoutDuration() <= 0
+}
 
 // DefaultBaseURL is the default base URL path for the frontend.
 const DefaultBaseURL = "/app"
@@ -1118,7 +1247,9 @@ func defaultConfig() Config {
 			GroupsClaim: DefaultOIDCGroupsClaim,
 		},
 		SlackNotify: SlackNotifyConfig{
-			Channel: "#dbbat",
+			Channel:      "#dbbat",
+			Terminations: true,
+			SQL:          true,
 		},
 		Dump: DumpConfig{
 			MaxSize:   DefaultDumpMaxSize,
@@ -1181,22 +1312,23 @@ func authProviderOverrideKey(key string) (string, bool) {
 // DBB_AUTH_CACHE_ENABLED -> auth_cache.enabled
 func envTransform(k, v string) (string, any) {
 	key := strings.ToLower(strings.TrimPrefix(k, "DBB_"))
+	// Exact names first, before any prefix rule: every entry in the table is
+	// more specific than the prefix rule that would otherwise swallow it (and
+	// most are matched by no prefix rule at all), so "exact wins" is what keeps
+	// e.g. DBB_MSSQL_TLS_MAX_VERSION out of mssql.tls.*.
+	if exact, ok := envExactKeys[key]; ok {
+		return exact, v
+	}
 	// Map known prefixes to nested paths
 	// query_storage_* -> query_storage.*
 	if strings.HasPrefix(key, "query_storage_") {
 		return "query_storage." + strings.TrimPrefix(key, "query_storage_"), v
 	}
-	// connection_retention -> connection.retention
-	//
-	// An exact match rather than a connection_* prefix rule, because
-	// DBB_CONNECTION_RETENTION deliberately does not follow the <table>_storage
-	// shape its query counterpart has, and "connection" is a word too many
-	// future settings could start with for a blanket prefix to be safe. A
-	// silently unmapped value would read as "unset" and inherit the query
-	// window — exactly the outcome this setting exists to avoid — so there is a
-	// test pinning that this mapping happens.
-	if key == "connection_retention" {
-		return "connection.retention", v
+	// query_tagging_* -> query_tagging.* (the config-file-shaped
+	// DBB_QUERY_TAGGING_ENABLED; the bare DBB_QUERY_TAGGING is in
+	// envExactKeys above).
+	if strings.HasPrefix(key, "query_tagging_") {
+		return "query_tagging." + strings.TrimPrefix(key, "query_tagging_"), v
 	}
 	// rate_limit_* -> rate_limit.*
 	if strings.HasPrefix(key, "rate_limit_") {
@@ -1234,13 +1366,6 @@ func envTransform(k, v string) (string, any) {
 	if strings.HasPrefix(key, "oidc_") {
 		return "oidc." + strings.TrimPrefix(key, "oidc_"), v
 	}
-	// slack_signing_secret -> slack_notify.signing_secret
-	// DBB_SLACK_SIGNING_SECRET is the canonical, documented name; the
-	// slack_notify_* prefix rule below keeps the legacy
-	// DBB_SLACK_NOTIFY_SIGNING_SECRET working as an accepted alias.
-	if key == "slack_signing_secret" {
-		return "slack_notify.signing_secret", v
-	}
 	// slack_notify_* -> slack_notify.*
 	if strings.HasPrefix(key, "slack_notify_") {
 		return "slack_notify." + strings.TrimPrefix(key, "slack_notify_"), v
@@ -1256,15 +1381,6 @@ func envTransform(k, v string) (string, any) {
 	// mongo_tls_* -> mongo.tls.*
 	if strings.HasPrefix(key, "mongo_tls_") {
 		return "mongo.tls." + strings.TrimPrefix(key, "mongo_tls_"), v
-	}
-	// mssql_tls_max_version -> mssql.tls_max_version
-	//
-	// This one is deliberately *not* under mssql.tls.*: the ceiling is a TDS
-	// encapsulation setting on MSSQLConfig, not one of the cert/key/disable
-	// knobs the five proxies share. It has to be tested before the mssql_tls_
-	// prefix rule below, which would otherwise swallow it.
-	if key == "mssql_tls_max_version" {
-		return "mssql.tls_max_version", v
 	}
 	// mssql_tls_* -> mssql.tls.*
 	if strings.HasPrefix(key, "mssql_tls_") {
@@ -1283,6 +1399,38 @@ func envTransform(k, v string) (string, any) {
 		return "mcp." + strings.TrimPrefix(key, "mcp_"), v
 	}
 	return key, v
+}
+
+// envExactKeys maps environment-variable names that are *not* a simple
+// <section>_<setting> prefix onto the koanf key they configure. Each one is
+// here for its own reason:
+//
+//   - connection_retention: DBB_CONNECTION_RETENTION deliberately does not
+//     follow the <table>_storage shape its query counterpart has, and
+//     "connection" is a word too many future settings could start with for a
+//     blanket prefix rule to be safe. A silently unmapped value would read as
+//     "unset" and inherit the query window — exactly the outcome the setting
+//     exists to avoid.
+//   - slack_signing_secret: DBB_SLACK_SIGNING_SECRET is the canonical,
+//     documented name; the slack_notify_* prefix rule keeps the legacy
+//     DBB_SLACK_NOTIFY_SIGNING_SECRET working as an accepted alias.
+//   - mssql_tls_max_version: the TDS encapsulation ceiling lives on
+//     MSSQLConfig, not among the cert/key/disable knobs the five proxies share,
+//     so it must not be swallowed by the mssql_tls_ prefix rule.
+//   - query_tagging: the feature is one boolean, and
+//     "DBB_QUERY_TAGGING_ENABLED=true" reads as a stutter — so the documented
+//     variable is the bare name. Without this mapping the operator turns
+//     tagging on, gets no error, and nothing happens. The config-file-shaped
+//     DBB_QUERY_TAGGING_ENABLED still works, through the query_tagging_ prefix
+//     rule.
+//
+// Every entry is looked up before any prefix rule, which is what makes the last
+// two behave.
+var envExactKeys = map[string]string{
+	"connection_retention":  "connection.retention",
+	"slack_signing_secret":  "slack_notify.signing_secret",
+	"mssql_tls_max_version": "mssql.tls_max_version",
+	"query_tagging":         "query_tagging.enabled",
 }
 
 // authProvisioningAliases maps the pre-rename keys the two auto-provisioning

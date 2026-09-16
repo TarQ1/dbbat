@@ -369,6 +369,11 @@ func (s *session) handleOALL8(ttcPayload []byte) error {
 			startTime: time.Now(),
 		}
 
+		// The call is about to go upstream, and startTime is stamped after any
+		// approval hold resolved — so the clock never charges a statement for
+		// the time it spent waiting on a human.
+		s.refreshStatementClock()
+
 		// An approval hold already inserted the row; reuse it rather than writing
 		// a second one for the same statement.
 		if approvalUID != uuid.Nil {
@@ -529,6 +534,11 @@ func (s *session) regateCursor(cursor *trackedCursor) error {
 			startTime: time.Now(),
 		}
 
+		// The call is about to go upstream, and startTime is stamped after any
+		// approval hold resolved — so the clock never charges a statement for
+		// the time it spent waiting on a human.
+		s.refreshStatementClock()
+
 		// An approval hold already inserted the row; reuse it rather than writing
 		// a second one for the same statement.
 		if approvalUID != uuid.Nil {
@@ -619,9 +629,21 @@ func (s *session) learnCursorID(ttcPayload []byte) {
 //
 // Callers hold trackerMu.
 func (s *session) flushPendingQuery() {
-	if s.tracker.pendingQuery != nil {
-		s.completeQuery(nil, nil)
+	if s.tracker.pendingQuery == nil {
+		return
 	}
+
+	// When dbbat is what ended the session, say so on the row: the call that
+	// was in flight is the one an operator goes looking for afterwards, and a
+	// row with no error reads as one that simply finished.
+	if t := s.recordedTermination(); t.Set() {
+		message := t.Message()
+		s.completeQuery(nil, &message)
+
+		return
+	}
+
+	s.completeQuery(nil, nil)
 }
 
 // handlePiggybackExec intercepts a v315+ piggyback execute-with-SQL message.
@@ -689,6 +711,11 @@ func (s *session) handlePiggybackExec(ttcPayload []byte) error {
 			cursor:    cursor,
 			startTime: time.Now(),
 		}
+
+		// The call is about to go upstream, and startTime is stamped after any
+		// approval hold resolved — so the clock never charges a statement for
+		// the time it spent waiting on a human.
+		s.refreshStatementClock()
 
 		if approvalUID != uuid.Nil {
 			s.tracker.pendingQuery.queryUID = approvalUID
@@ -783,6 +810,11 @@ func (s *session) handleJDBCExec(ttcPayload []byte) error {
 			cursor:    cursor,
 			startTime: time.Now(),
 		}
+
+		// The call is about to go upstream, and startTime is stamped after any
+		// approval hold resolved — so the clock never charges a statement for
+		// the time it spent waiting on a human.
+		s.refreshStatementClock()
 
 		// An approval hold already inserted the row; reuse it rather than writing
 		// a second one for the same statement.
@@ -1133,6 +1165,7 @@ func (s *session) completeQuery(rowsAffected *int64, queryError *string) {
 	}
 
 	s.tracker.pendingQuery = nil
+	s.refreshStatementClock()
 
 	// Last gate before the store: never persist an "error" that is not readable
 	// text. See shared.SanitizeQueryError.
@@ -1389,4 +1422,32 @@ func (s *session) setHeldQuery(uid uuid.UUID) {
 	s.heldMu.Lock()
 	s.heldQueryUID = uid
 	s.heldMu.Unlock()
+}
+
+// heldQuery is the uid of the statement currently parked on a human, uuid.Nil
+// when nothing is.
+func (s *session) heldQuery() uuid.UUID {
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+
+	return s.heldQueryUID
+}
+
+// refreshStatementClock points the session's statement clock at the call
+// currently executing upstream, or clears it when none is.
+//
+// Recomputed from the tracker rather than incremented and decremented: TTC is
+// request/response on one connection, so there is exactly one pending call at a
+// time and "recompute" is the same as "set or clear" — but reading the state
+// rather than tracking a second copy of it is what keeps the two from drifting.
+//
+// Callers hold trackerMu (every caller is inside a book()).
+func (s *session) refreshStatementClock() {
+	if s.tracker == nil || s.tracker.pendingQuery == nil {
+		s.statementClock.Stop()
+
+		return
+	}
+
+	s.statementClock.Rearm(s.tracker.pendingQuery.startTime)
 }

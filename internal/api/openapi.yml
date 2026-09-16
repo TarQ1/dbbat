@@ -2575,6 +2575,29 @@ paths:
             400 rather than silently dropped.
           schema:
             type: boolean
+        - name: uid_suffix
+          in: query
+          description: |
+            Filter by the last 12 hex characters of the connection uid — the
+            "c=" tag every proxied upstream session now advertises in its
+            application/program name (`dbbat/$version @$username
+            c=<uid_suffix> for $clientAppName`, e.g. PostgreSQL's
+            `application_name`, Oracle's `V$SESSION.PROGRAM`, MySQL's
+            `program_name` connect attribute, `APP_NAME()` on SQL Server,
+            `client.application.name` on MongoDB). Paste it from a
+            `pg_stat_activity` row (or equivalent) to jump straight to the
+            dbbat connection it came from.
+
+            Matched with `right(uid::text, 12)`, not a prefix: a UUIDv7's
+            leading characters are a millisecond timestamp shared by every
+            connection opened in the same instant, so only the trailing,
+            purely-random 12 hex characters identify one connection. Case
+            insensitive on input, normalized to lowercase. Must be exactly 12
+            hex characters — anything else is refused with 400 rather than
+            silently dropped.
+          schema:
+            type: string
+            pattern: '^[0-9a-fA-F]{12}$'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Offset'
       responses:
@@ -2624,6 +2647,92 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /connections/{uid}/terminate:
+    parameters:
+      - $ref: '#/components/parameters/ConnectionUID'
+
+    post:
+      tags:
+        - Connections
+      summary: End a live proxied session
+      description: |
+        Terminates one live session: dbbat cancels whatever statement is
+        running upstream, then drops both legs of the connection.
+
+        **`POST .../terminate`, not `DELETE /connections/{uid}`.** The session
+        is not the row. `DELETE` would read as deleting the ledger entry, which
+        retention owns and which the audit chain's
+        `connection.opened`/`connection.closed` pair exists to protect.
+
+        **Terminating is not revoking.** The grant is untouched, so the user can
+        reconnect immediately under it. Use `DELETE /grants/{uid}` to withdraw
+        the access itself — that ends *every* session of that user on that
+        database, this ends one.
+
+        **`202`, not `200`.** The replica serving this call is not necessarily
+        the one serving the session: `connections.run_id` says who is. The
+        request is written to the connection row, this replica signals its own
+        live sessions immediately, and the replica that owns the session acts on
+        it within about two seconds. `local` in the response says which of the
+        two happened.
+
+        The optional `reason` is recorded on the connection row and in the
+        `connection.terminated` audit entry. It is never shown to the client
+        whose session is ending.
+
+        **Requires admin role.**
+      operationId: terminateConnection
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  maxLength: 1000
+                  description: >-
+                    Why, for the audit log. Optional; an absent or empty body is
+                    a termination with no stated reason.
+      responses:
+        '202':
+          description: The session is live and the termination was requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  local:
+                    type: boolean
+                    description: >-
+                      True when this replica was serving the session and
+                      signaled it directly, so it is already tearing down. False
+                      means the session belongs to another replica, which picks
+                      the request up on its next poll (about two seconds), or
+                      that it was already terminating from an earlier request.
+                required:
+                  - message
+                  - local
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The connection is already closed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -3806,6 +3915,37 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/PublicEndpoints'
+      responses:
+        '204':
+          description: Settings saved
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /instance/limits:
+    put:
+      tags:
+        - Instance
+      summary: Update instance-wide limits
+      description: >-
+        Writes the `limits.*` parameter group. Admin-only. An empty
+        `statement_timeout` clears the parameter, falling back to
+        DBB_STATEMENT_TIMEOUT; "0" disables the limit outright.
+      operationId: updateInstanceLimits
+      security:
+        - basicAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InstanceLimits'
       responses:
         '204':
           description: Settings saved
@@ -5291,6 +5431,18 @@ components:
           type: integer
           format: int64
           nullable: true
+        statement_timeout_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 86400
+          nullable: true
+          description: |
+            Per-statement time limit for grants issued from this definition.
+            Three states: `null`/omitted inherits the instance-wide default
+            (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+            means explicitly no limit, overriding that default; a positive
+            value is the limit in seconds.
         priority:
           type: integer
           format: int32
@@ -5466,6 +5618,18 @@ components:
           type: integer
           format: int64
           nullable: true
+        statement_timeout_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 86400
+          nullable: true
+          description: |
+            Per-statement time limit for grants issued from this definition.
+            Three states: `null`/omitted inherits the instance-wide default
+            (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+            means explicitly no limit, overriding that default; a positive
+            value is the limit in seconds.
         priority:
           type: integer
           format: int32
@@ -5608,6 +5772,24 @@ components:
         clear_max_bytes_transferred:
           type: boolean
           description: When true, resets max_bytes_transferred to unlimited.
+        statement_timeout_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 86400
+          nullable: true
+          description: |
+            Per-statement time limit for grants issued from this definition.
+            Three states: `null`/omitted inherits the instance-wide default
+            (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+            means explicitly no limit, overriding that default; a positive
+            value is the limit in seconds.
+        clear_statement_timeout_seconds:
+          type: boolean
+          description: >-
+            When true, resets statement_timeout_seconds to null, i.e. back to
+            inheriting the instance-wide default. Needed because `null` and `0`
+            mean different things here, so sending `null` cannot express it.
         priority:
           type: integer
           format: int32
@@ -6218,6 +6400,22 @@ components:
           type: integer
           format: int64
           description: Total bytes transferred
+        termination_reason:
+          type: string
+          nullable: true
+          enum:
+            - statement_timeout
+            - grant_expired
+            - quota_exceeded
+            - grant_revoked
+            - admin_terminated
+            - instance_lost
+          description: >-
+            Why *dbbat* ended this session, when dbbat is what ended it. Absent
+            — the ordinary case — means the client or the network did.
+            `admin_terminated` is `POST /connections/{uid}/terminate`;
+            `instance_lost` means nobody ended it — the process serving it died
+            and the crash reconcile closed the row on its behalf.
         upstream_tls:
           type: boolean
           description: >-
@@ -6238,6 +6436,30 @@ components:
             updated afterwards. Null on connections that predate this column,
             or whose grant has since been deleted (revocation does not clear
             it — only deletion, which does not otherwise happen, does).
+        terminate_requested_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            When an admin asked for this session to end, through
+            `POST /connections/{uid}/terminate`. It is an *intent*, not an
+            outcome: the replica serving the API call is not necessarily the
+            one serving the session, so this is written first and the owning
+            replica acts on it within a couple of seconds. A session that
+            closed on its own in between keeps this set with no
+            `termination_reason`.
+        terminate_requested_by:
+          type: string
+          format: uuid
+          nullable: true
+          description: The admin who asked. Null when nobody did.
+        terminate_reason:
+          type: string
+          nullable: true
+          description: >-
+            That admin's free text, never shown to the client whose session is
+            ending. Distinct from `termination_reason`, which is the closed
+            vocabulary describing what actually happened.
       required:
         - uid
         - user_id
@@ -6284,10 +6506,34 @@ components:
                 lifetime count and does not settle it either. True means
                 retention cannot explain a missing statement — with retention
                 disabled, the default, it is always true.
+            terminated_by:
+              allOf:
+                - $ref: '#/components/schemas/TerminationRequester'
+              nullable: true
+              description: >-
+                The admin named by `terminate_requested_by`, resolved to a
+                username so the page can say "terminated by alice". Absent when
+                nobody asked for this session to end, and when the account that
+                did has since been deleted.
           required:
             - dump
             - grant
             - statements_retained
+
+    # TerminationRequester names the admin behind terminate_requested_by, so a
+    # connection detail page does not have to fetch a user to render "terminated
+    # by alice".
+    TerminationRequester:
+      type: object
+      properties:
+        uid:
+          type: string
+          format: uuid
+        username:
+          type: string
+      required:
+        - uid
+        - username
 
     # GrantSummary is the small slice of AccessGrant the UI needs to show
     # "under which grant did this session run?" on a connection detail page
@@ -7128,11 +7374,53 @@ components:
           $ref: '#/components/schemas/PublicEndpoints'
           nullable: true
           description: Only present for admin callers
+        limits:
+          $ref: '#/components/schemas/InstanceLimits'
+          nullable: true
+          description: Only present for admin callers
         resolved:
           $ref: '#/components/schemas/ResolvedEndpoints'
+        resolved_limits:
+          $ref: '#/components/schemas/ResolvedInstanceLimits'
       required:
         - listen
         - resolved
+        - resolved_limits
+
+    InstanceLimits:
+      type: object
+      description: >-
+        Raw operator-configured instance-wide limits (the `limits.*` parameter
+        group), before the environment-variable fallback is applied.
+      properties:
+        statement_timeout:
+          type: string
+          description: >-
+            Go duration string ("30s", "5m") bounding how long a single
+            statement may run. Empty means the parameter is unset and
+            DBB_STATEMENT_TIMEOUT applies; "0" disables the limit outright.
+      required:
+        - statement_timeout
+
+    ResolvedInstanceLimits:
+      type: object
+      description: The instance-wide limits that actually apply.
+      properties:
+        statement_timeout_seconds:
+          type: integer
+          format: int64
+          description: Effective per-statement limit in seconds; 0 = no limit.
+        statement_timeout_source:
+          type: string
+          enum: ['', parameter, env]
+          description: >-
+            Where the effective value came from: `parameter` when the store
+            parameter is set (including to an explicit "0", which disables the
+            limit), `env` when the environment variable supplies it, empty when
+            neither is configured.
+      required:
+        - statement_timeout_seconds
+        - statement_timeout_source
 
     # Common schemas
     Error:

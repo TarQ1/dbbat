@@ -263,6 +263,141 @@ deleted and the server still starts. See
 [Query Logging](/docs/features/query-logging#retention) for exactly what a sweep
 removes.
 
+### Per-statement time limits
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DBB_STATEMENT_TIMEOUT` | How long any single statement may run before dbbat cancels it and ends the session, as a Go duration (`30s`, `5m`). Empty or `0` = no limit. | `` (no limit) |
+
+This is the **deployment default**, the lowest of three layers:
+
+1. a grant definition's `statement_timeout_seconds` wins over everything —
+   including an explicit `0`, which means "no limit for this definition" and is
+   how a dump or ETL definition stays usable;
+2. otherwise the `limits.statement_timeout` [global parameter](#global-parameters),
+   editable from the Settings page without a restart;
+3. otherwise this variable.
+
+Like retention, it is **opt-in**: upgrading dbbat never starts cancelling
+statements on its own. A malformed value disables the limit with a startup
+warning rather than shortening it — this setting kills live database sessions,
+so a typo must never be read as "kill sooner".
+
+Enforcement is dbbat's own watchdog, not the database's. Where a protocol has a
+server-side knob (PostgreSQL's `statement_timeout`, MySQL's
+`max_execution_time`, MongoDB's `maxTimeMS`) dbbat sets it too, so the client
+gets a real database error instead of a dropped socket — but Oracle and SQL
+Server have no such knob, and a client can try to unset the ones that exist, so
+the watchdog is what the limit actually rests on. It kills within about 2.25
+seconds of the limit and cancels the statement upstream before closing the
+sockets. See
+[Access Control](/docs/features/access-control#per-statement-time-limits).
+
+### Statement tagging (optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DBB_QUERY_TAGGING` | Tag every statement forwarded to the target with the dbbat identity — a comment on PostgreSQL and MySQL, the `comment` command field on MongoDB | `false` |
+| `DBB_QUERY_TAGGING_ORACLE` | Oracle's own switch: `off`, or `user` for a tag carrying the version, the user and the grant and **no** `conn=` | `off` |
+
+Every dbbat session logs in to the target as the **same shared database role**,
+from the **same host** — the proxy. So the target's own tooling attributes the
+whole fleet's load to one client: RDS Performance Insights shows one user and
+one host, `pg_stat_statements` has no `application_name` dimension at all, and
+the slow query log prints statement text and nothing else.
+
+What all of them do show is the statement itself. Turn this on and dbbat
+prepends a [sqlcommenter](https://google.github.io/sqlcommenter/)-style
+comment:
+
+```sql
+/*dbbat='0.28.1',user='florent',conn='3f9a1c7b2e4d',grant='diag-paris-habitat'*/ SELECT ...
+```
+
+- `dbbat` — the dbbat version that forwarded the statement
+- `user` — the dbbat user, not the shared database role
+- `conn` — the last 12 hex characters of the dbbat connection uid, the same tag
+  the upstream `application_name` / `program_name` carries. Paste it into the
+  connections page search box, or call
+  `GET /api/v1/connections?uid_suffix=3f9a1c7b2e4d`
+- `grant` — the slug of the grant definition the session is running under
+
+**MongoDB gets the same tag, in the place MongoDB has for it.** There is no
+statement text to comment, so the identity rides in the command's `comment`
+field — the one `system.profile`, the Atlas Query Profiler and
+`db.currentOp()` echo back:
+
+```js
+{ find: "widgets", filter: { … }, comment: "dbbat='0.28.1',user='florent',conn='3f9a1c7b2e4d',grant='diag-paris-habitat'" }
+```
+
+It is the same string, so one search finds a session whatever the protocol. Two
+MongoDB-specific rules: it is applied to the commands whose `comment` support
+MongoDB documents (`find`, `aggregate`, `count`, `distinct`, `insert`,
+`update`, `delete`, `findAndModify`, `getMore`, `mapReduce`, `bulkWrite`) and
+to no others, and **a client-supplied `comment` wins** — that command is
+forwarded untouched, because the field is single-valued and a driver's or
+ORM's own tracing may already own it. Such a command is still attributable: the
+profiler records `appName`, which dbbat tags on every session. See
+[the MongoDB notes](https://github.com/fclairamb/dbbat/blob/main/docs/mongodb.md).
+
+**Oracle has its own variable**, `DBB_QUERY_TAGGING_ORACLE`, and
+`DBB_QUERY_TAGGING` deliberately does not reach it. `V$SQL` keys on statement
+text, so every distinct tag is a distinct SQL_ID holding its own shared-pool
+cursor — the tag buys attribution by spending shared pool, and that trade-off is
+Oracle's alone. Measured on Oracle 23ai with one join executed 600 times: the
+`conn=` tag spread over 200 sessions cost 200 cursors and 9.6 MB, growing with
+every session opened. Dropping `conn=` bounds it by the number of dbbat *users*
+instead — 20 identities cost 20 cursors, one hard parse each and ~48 KB apiece,
+then plateau, with a second 600 executions adding nothing at all. So the only
+non-off value is `user`:
+
+```sql
+/*dbbat='0.28.1',user='florent',grant='diag-paris-habitat'*/ SELECT ...
+```
+
+Turning it on does not oblige the proxy to tag. Unlike the three protocols
+above, Oracle relays the client's own TNS packets, so a statement can only carry
+the tag when dbbat can relocate it in the frame **to the byte** and re-encode
+that frame back to the client's own bytes. A session whose client shape it
+cannot certify runs untagged from start to finish and logs why — deliberately
+all-or-nothing per session, because a statement tagged on some executions and
+not others would get *two* SQL_IDs and double the cursor count the whole design
+is about. Anything other than `off` or `user` fails the process at startup. The
+numbers and the encoding details are in
+[the Oracle notes](https://github.com/fclairamb/dbbat/blob/main/docs/oracle.md).
+SQL Server is a follow-up.
+
+**Off by default**, because it changes the bytes the database receives — a
+deployment that pins statement text (a `pg_stat_statements` allowlist, a query
+firewall, a per-statement plan cache) should turn it on knowingly. It is also
+the one setting here that makes a statement ~90 bytes longer, so a MySQL
+statement that was already within ~90 bytes of `max_allowed_packet` will start
+being rejected.
+
+The tag carries **no timestamp and no per-statement id**, on purpose: two
+executions of the same statement stay byte-identical, so `pg_stat_statements`
+and the MySQL digest keep aggregating them into one row instead of one row per
+execution.
+
+**It changes nothing dbbat stores or enforces.** Every grant control
+(`read_only`, `block_ddl`, `block_copy`), every bypass scan and every
+approval-hold pattern runs on the statement — or, on MongoDB, the command — the
+**client** sent, before the tag exists — so a pattern author never has to account for it. The `queries` table,
+the tamper-evident audit chain, the UI's query-text search and the `.pcapng`
+session captures all hold the client's text too. The tag is a pure function of
+`(version, user, connection, grant)`, all of which the connection row already
+stores, so it is reconstructible without being persisted.
+
+**One known limit, not fixed on purpose.** `pg_stat_statements` keeps the text
+of the *first* execution of a digest, so two dbbat users running the same
+statement share a row whose tag names whichever of them ran it first. The
+numbers stay correct; the label is misleading. Performance Insights has the same
+property per digest, as does MySQL's `QUERY_SAMPLE_TEXT`. Making the digest
+per-user would mean varying the tag per user, which stops aggregation
+altogether — a worse outcome. `pg_stat_activity`, `events_statements_current`
+and the slow logs are exact.
+
 ### Rate Limiting
 
 | Variable | Description | Default |
@@ -473,6 +608,36 @@ only the transport differs. Socket Mode and the HTTP endpoint can both be
 configured; at the Slack app level, enabling Socket Mode makes Slack deliver over
 the socket and ignore the request URL.
 
+#### Session termination notifications (optional)
+
+When a bot token is configured, DBBat also posts to `DBB_SLACK_NOTIFY_CHANNEL`
+whenever it ends a session on its own for a reason worth a human's attention:
+
+| Reason | Posted |
+|--------|--------|
+| `statement_timeout` | yes |
+| `admin_terminated` | yes — names the admin and their reason |
+| `quota_exceeded` | yes |
+| `grant_revoked` | no — already went through a human |
+| `grant_expired` | no — routine |
+| `instance_lost` | no — covered by infrastructure alerting elsewhere |
+
+The message names the user (`@`-mentioned when they have a linked Slack
+identity), the grant, the reason, and — for a statement timeout — the limit and
+how long the statement actually ran. It carries no buttons: there is no
+decision left to make, only something to know happened.
+
+| Variable | Description |
+|----------|-------------|
+| `DBB_SLACK_NOTIFY_TERMINATIONS` | Enable termination notifications. Default `true`; only meaningful when `DBB_SLACK_NOTIFY_BOT_TOKEN` is set. |
+| `DBB_SLACK_NOTIFY_SQL` | Include the (truncated, 200-character) statement text that was running when dbbat acted. Default `true` — mirrors `DBB_APPROVAL_SLACK_SQL` for approval-hold escalations, since Slack is a lower trust boundary than the DBBat UI. |
+
+A client stuck in a reconnect loop that trips the same limit over and over
+would otherwise flood the channel with identical messages. DBBat coalesces:
+the first termination for a given (user, database, reason) posts immediately,
+and any further one within a 10-minute window is folded into a single
+follow-up ("+7 more in the last 10 min") posted once the window closes.
+
 ## Configuration File
 
 DBBat supports YAML, JSON, and TOML configuration files.
@@ -493,6 +658,9 @@ query_storage:
   max_result_rows: 100000
   max_result_bytes: 104857600
   retention: "0" # keep forever; e.g. "720h" for 30 days
+
+query_tagging:
+  enabled: false # prepend /*dbbat=...,user=...,conn=...,grant=...*/ upstream
 
 rate_limit:
   enabled: true
@@ -565,6 +733,7 @@ values are exposed by `GET /api/v1/instance`.
 | Parameter | Description |
 |-----------|-------------|
 | `public.web_ui_url` | Externally reachable base URL of the web UI, used for Slack deep-links. **Takes precedence over `DBB_PUBLIC_URL`** when set. |
+| `limits.statement_timeout` | Instance-wide per-statement time limit, as a Go duration (`30s`, `5m`). **Takes precedence over `DBB_STATEMENT_TIMEOUT`** when set; `"0"` disables the limit outright. Edited from the Settings page, or through `PUT /api/v1/instance/limits`. |
 
 ```bash
 # Read the current parameters

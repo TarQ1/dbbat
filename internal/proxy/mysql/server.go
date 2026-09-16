@@ -10,6 +10,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gomysqlserver "github.com/go-mysql-org/go-mysql/server"
@@ -67,6 +68,19 @@ type Server struct {
 	shutdown chan struct{}
 	ctx      context.Context //nolint:containedctx // Context is needed for the server lifecycle
 	cancel   context.CancelFunc
+
+	// statementTimeouts resolves the instance-wide per-statement limit at
+	// every session's auth. nil — the default — means no limit is imposed
+	// beyond whatever the grant definition carries.
+	statementTimeouts *shared.StatementTimeoutResolver
+
+	// queryTagging prepends the dbbat identity comment to every statement text
+	// handed to the upstream (DBB_QUERY_TAGGING). Off by default.
+	//
+	// Atomic, unlike its neighbors above: those are installed before Start,
+	// but this one is also flipped on an already-listening server (the
+	// integration suite does exactly that), and every session's auth reads it.
+	queryTagging atomic.Bool
 }
 
 // NewServer creates a new MySQL proxy server.
@@ -289,10 +303,24 @@ func (s *Server) runDumpCleanup() {
 	}
 }
 
+// SetStatementTimeouts installs the resolver for the instance-wide
+// per-statement limit. Called by the wiring in main; a server without one never
+// imposes a limit that the grant definition did not itself carry.
+func (s *Server) SetStatementTimeouts(r *shared.StatementTimeoutResolver) {
+	s.statementTimeouts = r
+}
+
 // SetApprovalDeps installs the approval-hold collaborators. A server without
 // them never holds anything.
 func (s *Server) SetApprovalDeps(deps shared.ApprovalDeps) {
 	s.approvalDeps = deps
+}
+
+// SetQueryTagging turns the sqlcommenter-style statement tag on. Called by the
+// wiring in main from DBB_QUERY_TAGGING; a server without it forwards every
+// statement byte-for-byte as it always did.
+func (s *Server) SetQueryTagging(enabled bool) {
+	s.queryTagging.Store(enabled)
 }
 
 // SetRowWriter installs the process-wide result-row writer, replacing (and

@@ -43,12 +43,26 @@ type session struct {
 	authCache       *cache.AuthCache
 
 	// Connection metadata
-	serviceName   string
-	username      string
-	database      *store.Server
-	user          *store.User
-	grant         *store.Grant
+	serviceName string
+	username    string
+	database    *store.Server
+	user        *store.User
+	grant       *store.Grant
+	// connectionUID is set only once CreateConnection has actually inserted
+	// the row it names — uuid.Nil until then, which is what every dump/
+	// close/record-write gate below tests for ("is there a row to write
+	// against"). It is NOT what tags AUTH_PROGRAM_NM: that needs the uid
+	// before this row can possibly exist (beginUpstreamAuth, step 4b, runs
+	// well before CreateConnection at step 7), so buildUpstreamProgramName
+	// uses connUID instead (below).
 	connectionUID uuid.UUID
+	// connUID is generated up front (store.NewConnectionUID), before
+	// beginUpstreamAuth runs, so AUTH_PROGRAM_NM can be tagged with it
+	// (shared.BuildUpstreamName's "c=" field). CreateConnection pins the row
+	// to this exact value (store.WithUID), so once it succeeds
+	// connectionUID and connUID are the same value — but only
+	// connectionUID's non-nil-ness means the row exists.
+	connUID uuid.UUID
 
 	// databaseCandidates holds every dbbat database sharing the connect
 	// string's oracle_service_name when that name is ambiguous (a mutualized
@@ -231,6 +245,22 @@ type session struct {
 	heldMu       sync.Mutex
 	heldQueryUID uuid.UUID
 
+	// statementTimeouts resolves the instance-wide per-statement limit (set
+	// from the server at session creation); statementLimit is this session's
+	// resolved value (0 = no limit), stamped at auth; statementClock marks the
+	// call currently executing upstream.
+	//
+	// Oracle has no server-side statement timeout, so on this protocol the
+	// watchdog is the entire mechanism and the break marker is its only cancel.
+	statementTimeouts *shared.StatementTimeoutResolver
+	statementLimit    time.Duration
+	statementClock    shared.StatementClock
+
+	// termination records why dbbat ended this session, when dbbat is what
+	// ended it.
+	terminationMu sync.Mutex
+	termination   store.Termination
+
 	// guard enforces the grant's time-window and bandwidth limits mid-stream.
 	guard *shared.LimitGuard
 
@@ -256,6 +286,9 @@ type session struct {
 	// revocation is signaled when this session's grant is revoked mid-flight,
 	// so the next command is rejected and the watchdog tears the session down.
 	revocation *cache.RevocationHandle
+	// liveSession is signaled when an admin ends *this* session, keyed by the
+	// connection uid rather than by the grant.
+	liveSession *cache.SessionHandle
 
 	// oer holds the negotiated layout of the TTC summary object, so a refusal
 	// dbbat synthesizes is framed the way this client parses one. Its
@@ -279,6 +312,15 @@ type session struct {
 	oer           oerShape
 	oerSeq        int
 	oerCallNumber byte
+
+	// statementTaggingEnabled is DBB_QUERY_TAGGING_ORACLE=user, resolved at
+	// startup and stamped on the session by the server.
+	statementTaggingEnabled bool
+
+	// tagging carries the per-user statement tag and the once-per-session
+	// decision about whether this client's frames can be rewritten to hold it.
+	// Inert unless statementTaggingEnabled. See statement_tagging.go.
+	tagging statementTagging
 }
 
 // cumulativeClientBytes returns the running total of bytes exchanged with
@@ -331,6 +373,7 @@ func newSession(
 		bytesFromClient: bytesFromClient,
 		bytesToClient:   bytesToClient,
 		oer:             defaultOERShape(),
+		connUID:         store.NewConnectionUID(),
 	}
 
 	// Assigned separately so a nil store stays a nil interface rather than a
@@ -501,11 +544,20 @@ func (s *session) run() error {
 	// s.grant is always set here: authenticateClient (step 5, above) returns
 	// an error — aborting run() before this point — whenever the grant lookup
 	// fails.
+	//
+	// WithUID pins the row to s.connUID, generated in newSession — well
+	// before beginUpstreamAuth (step 4b) tagged AUTH_PROGRAM_NM with it.
 	conn, err := s.store.CreateConnection(s.ctx, s.user.UID, s.database.UID, sourceIP,
-		store.WithUpstreamTLS(false), store.WithGrantUID(s.grant.UID))
-	if err == nil {
+		store.WithUID(s.connUID), store.WithUpstreamTLS(false), store.WithGrantUID(s.grant.UID))
+	if err != nil {
+		s.logger.ErrorContext(s.ctx, "failed to create connection record", slog.Any("error", err))
+	} else {
 		s.connectionUID = conn.UID
 	}
+
+	// The per-user statement tag needs the user and the grant, both settled by
+	// now. It stays inert unless DBB_QUERY_TAGGING_ORACLE=user.
+	s.configureStatementTagging()
 
 	upstreamAddr := net.JoinHostPort(s.database.Host, fmt.Sprintf("%d", s.database.Port))
 	s.logger.InfoContext(s.ctx, "Oracle session established, entering proxy mode",
@@ -1142,6 +1194,9 @@ func (s *session) authenticateClient(phase1Pkt *TNSPacket) error {
 
 	s.grant = grant
 
+	// Resolve the per-statement limit once, next to the grant it comes from.
+	s.statementLimit = s.statementTimeouts.For(s.ctx, grant)
+
 	// Check quotas
 	if err := s.checkQuotas(); err != nil {
 		return err
@@ -1513,13 +1568,20 @@ func (s *session) proxyMessages() error {
 
 	s.revocation = s.store.Revocations().Register(grantUID)
 
+	// And register it by connection uid, which is the only identifier an admin
+	// has: that is what POST /connections/{uid}/terminate — and the poller
+	// relaying such a request from another replica — signals.
+	s.liveSession = s.store.Sessions().Register(s.connectionUID)
+
 	// Build the limit guard now that the grant is known, and run a watchdog to
 	// tear the session down if a limit is crossed (or the grant is revoked)
 	// while a query is blocked producing no traffic. The inline check in
 	// upstreamToClient handles the actively-streaming case with a clean TTC
 	// error frame.
 	s.guard = shared.NewLimitGuard(s.grant, s.bytesFromClient, s.bytesToClient).
-		WithRevocation(s.revocation.Flag())
+		WithRevocation(s.revocation.Flag()).
+		WithTermination(s.liveSession).
+		WithStatementTimeout(s.statementLimit, shared.StatementTimeoutGrace, &s.statementClock)
 
 	databaseName := ""
 	if s.database != nil {
@@ -1953,7 +2015,82 @@ func (s *session) onLimitViolation(err error) {
 
 	s.logger.WarnContext(s.ctx, logMsgWatchdogTeardown, attrs...)
 
+	s.noteTermination(err)
+	s.breakUpstreamStatement()
+
 	s.closeConns()
+}
+
+// breakUpstreamStatement sends a TNS break marker on the upstream leg, asking
+// the server to interrupt the call it is executing.
+//
+// Oracle has no in-band statement time limit (a per-statement cap is a Resource
+// Manager plan, which is DBA territory, and CALL_TIMEOUT is an OCI *client*
+// setting), so unlike PostgreSQL and MySQL there is no polite server-side path
+// this is backing up — the watchdog is the whole of the enforcement, and this
+// is its only attempt at stopping the work rather than merely stopping the
+// session.
+//
+// Best effort, and explicitly **unverified**: the marker exchange is documented
+// from the client's side, dbbat is playing the client here, and the end-to-end
+// suite has not yet proven a real server abandons the call on this alone. The
+// socket close that follows is the guarantee; this is what might spare the
+// database the rest of the scan. See docs/oracle.md.
+func (s *session) breakUpstreamStatement() {
+	if s.upstreamConn == nil || !s.statementClock.Running() {
+		return
+	}
+
+	if _, err := s.upstreamConn.Write(buildBreakMarker()); err != nil {
+		s.logger.DebugContext(s.ctx, "failed to send the upstream break marker",
+			slog.Any("error", err))
+
+		return
+	}
+
+	// The reset marker is the second half of the exchange: a client that breaks
+	// follows with a reset to resynchronize the stream. Sent immediately rather
+	// than after reading the server's acknowledgement, because the relay
+	// goroutine owns the upstream reader and this session is going away.
+	if _, err := s.upstreamConn.Write(buildResetMarker()); err != nil {
+		s.logger.DebugContext(s.ctx, "failed to send the upstream reset marker",
+			slog.Any("error", err))
+
+		return
+	}
+
+	// Let the two markers reach the server before the socket is dropped: an
+	// immediate close can RST them away, which would leave the server running
+	// the very statement this is trying to stop.
+	time.Sleep(breakSettleDelay)
+}
+
+// breakSettleDelay is how long the teardown waits after the break/reset
+// exchange before dropping the sockets. Bounded and short: the session is
+// already gone, and this only buys the markers a chance to land.
+const breakSettleDelay = 150 * time.Millisecond
+
+// noteTermination records why dbbat is ending this session. First writer wins.
+func (s *session) noteTermination(err error) {
+	t := shared.TerminationFor(err, s.guard, s.heldQuery())
+	if !t.Set() {
+		return
+	}
+
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	if !s.termination.Set() {
+		s.termination = t
+	}
+}
+
+// recordedTermination returns the termination reason, if any.
+func (s *session) recordedTermination() store.Termination {
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	return s.termination
 }
 
 // closeConns drops both sockets, which is how a session is ended from outside
@@ -1993,33 +2130,8 @@ func (s *session) clientToUpstream() error {
 
 		// Only intercept Data packets
 		if pkt.Type == TNSPacketTypeData && len(pkt.Payload) >= ttcDataFlagsSize+1 {
-			// A statement whose TTC message is larger than the negotiated SDU
-			// arrives as several packets, and gating the first one on its own is
-			// how the gate came to enforce against a fragment. Collect the whole
-			// message first; the gate reads the reassembly, the upstream gets the
-			// client's own packets. See reassembly.go.
-			msg, err := s.collectStatementMessage(pkt)
-			if err != nil {
+			if err := s.gateAndForwardDataMessage(pkt); err != nil {
 				return err
-			}
-
-			s.fragmentedMessage = msg
-
-			blocked := s.interceptClientMessage(msg.gate)
-
-			s.fragmentedMessage = nil
-
-			if blocked {
-				// Every fragment is dropped, not just the first: the refusal was
-				// answered once, and letting a continuation through on its own is
-				// what used to desynchronize the upstream and kill the session.
-				continue
-			}
-
-			for _, frag := range msg.packets {
-				if err := writeTNSPacket(s.upstreamConn, frag); err != nil {
-					return fmt.Errorf("upstream write error: %w", err)
-				}
 			}
 
 			continue
@@ -2030,6 +2142,58 @@ func (s *session) clientToUpstream() error {
 			return fmt.Errorf("upstream write error: %w", err)
 		}
 	}
+}
+
+// gateAndForwardDataMessage runs one client Data message through the gate and
+// writes what survives it upstream.
+//
+// A statement whose TTC message is larger than the negotiated SDU arrives as
+// several packets, and gating the first one on its own is how the gate came to
+// enforce against a fragment. So the whole message is collected first: the gate
+// reads the reassembly, and the upstream gets the client's own packets. See
+// reassembly.go.
+func (s *session) gateAndForwardDataMessage(pkt *TNSPacket) error {
+	msg, err := s.collectStatementMessage(pkt)
+	if err != nil {
+		return err
+	}
+
+	s.fragmentedMessage = msg
+
+	blocked := s.interceptClientMessage(msg.gate)
+
+	s.fragmentedMessage = nil
+
+	if blocked {
+		// Every fragment is dropped, not just the first: the refusal was
+		// answered once, and letting a continuation through on its own is what
+		// used to desynchronize the upstream and kill the session.
+		return nil
+	}
+
+	// Everything above ran on the client's own text: the controls, the `queries`
+	// row, the audit chain, the capture and any approval hold. This is the one
+	// point where the bytes going upstream may differ from the bytes that
+	// arrived — see statement_tagging.go, which forwards the client's packets
+	// untouched unless the statement can be relocated exactly *and* this session
+	// was certified for it.
+	if tagged, ok := s.rewriteStatementMessage(msg); ok {
+		for _, frame := range tagged {
+			if _, err := s.upstreamConn.Write(frame); err != nil {
+				return fmt.Errorf("upstream write error: %w", err)
+			}
+		}
+
+		return nil
+	}
+
+	for _, frag := range msg.packets {
+		if err := writeTNSPacket(s.upstreamConn, frag); err != nil {
+			return fmt.Errorf("upstream write error: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // interceptClientMessage examines a TNS Data packet from the client.
@@ -3392,11 +3556,20 @@ func (s *session) cleanup() {
 	s.flushPendingQuery()
 	s.trackerMu.Unlock()
 
+	// "terminated" before "closed": a watcher should learn why the session
+	// ended before it learns that it did.
+	termination := s.recordedTermination()
+	if termination.Set() {
+		s.stream.ConnectionWithReason(s.ctx, shared.ConnectionTerminated, termination.Reason)
+	}
+
 	s.stream.Connection(s.ctx, shared.ConnectionClosed)
 
 	if s.grant != nil && s.revocation != nil {
 		s.store.Revocations().Deregister(s.grant.UID, s.revocation)
 	}
+
+	s.store.Sessions().Deregister(s.connectionUID, s.liveSession)
 
 	if s.dump != nil {
 		if err := s.dump.Close(); err != nil {
@@ -3409,7 +3582,7 @@ func (s *session) cleanup() {
 	}
 
 	if s.connectionUID != uuid.Nil {
-		if err := s.store.CloseConnection(s.ctx, s.connectionUID); err != nil {
+		if err := s.store.CloseConnectionWithReason(s.ctx, s.connectionUID, termination); err != nil {
 			s.logger.ErrorContext(s.ctx, "failed to close connection record", slog.Any("error", err))
 		}
 	}

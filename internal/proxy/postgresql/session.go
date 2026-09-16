@@ -21,6 +21,7 @@ import (
 	"github.com/fclairamb/dbbat/internal/config"
 	"github.com/fclairamb/dbbat/internal/dump"
 	"github.com/fclairamb/dbbat/internal/proxy/shared"
+	"github.com/fclairamb/dbbat/internal/proxy/upstream"
 	"github.com/fclairamb/dbbat/internal/safe"
 	"github.com/fclairamb/dbbat/internal/store"
 )
@@ -126,10 +127,23 @@ type Session struct {
 	tlsConfig    *tls.Config // nil when TLS is disabled
 
 	// Session state
-	user                  *store.User
-	database              *store.Server
-	grant                 *store.Grant
-	connectionUID         uuid.UUID
+	user     *store.User
+	database *store.Server
+	grant    *store.Grant
+	// connectionUID is set only once CreateConnection has actually inserted
+	// the row it names — uuid.Nil until then, which is what every dump/
+	// close/record-write gate below tests for ("is there a row to write
+	// against"). It is NOT what tags the upstream application_name: that
+	// needs the uid before this row can possibly exist, so connectUpstream
+	// uses connUID instead (below).
+	connectionUID uuid.UUID
+	// connUID is generated up front (store.NewConnectionUID), before
+	// connectUpstream runs, so the upstream application_name can be tagged
+	// with it (shared.BuildUpstreamName's "c=" field). CreateConnection
+	// pins the row to this exact value (store.WithUID), so once it
+	// succeeds connectionUID and connUID are the same value — but only
+	// connectionUID's non-nil-ness means the row exists.
+	connUID               uuid.UUID
 	clientBackend         *pgproto3.Backend  // To communicate with client (we're the server)
 	upstreamFrontend      *pgproto3.Frontend // To communicate with upstream (we're the client)
 	authenticated         bool
@@ -140,6 +154,35 @@ type Session struct {
 	upstreamTLS           bool                    // Whether the proxy→upstream leg ended up encrypted
 	guard                 *shared.LimitGuard      // Mid-stream time/bandwidth limit enforcement
 	revocation            *cache.RevocationHandle // Signaled when this session's grant is revoked mid-flight
+	liveSession           *cache.SessionHandle    // Signaled when an admin ends *this* session (POST /connections/{uid}/terminate)
+
+	// queryTagging mirrors the server's DBB_QUERY_TAGGING setting; queryTag is
+	// the tagger built from it at auth. The tagger's zero value is inert, so
+	// every call site is unconditional and the disabled path changes nothing.
+	queryTagging bool
+	queryTag     shared.QueryTagger
+
+	// statementTimeouts resolves the instance-wide per-statement limit;
+	// statementLimit is this session's resolved value (0 = no limit), stamped
+	// at auth from the grant definition and the instance default;
+	// statementClock marks the oldest statement currently executing upstream.
+	statementTimeouts *shared.StatementTimeoutResolver
+	statementLimit    time.Duration
+	statementClock    shared.StatementClock
+
+	// upstreamKey is the cancellation key the *upstream server* issued for
+	// this session's backend. dbbat forwards it to the client verbatim, so it
+	// is also what a client CancelRequest carries — but this copy is what the
+	// watchdog uses to cancel a runaway statement from dbbat's own side, on a
+	// fresh connection through the same dial path.
+	upstreamKey *pgproto3.BackendKeyData
+
+	// termination records why dbbat ended this session, when dbbat is what
+	// ended it. Written once by the watchdog, read by cleanup to stamp the
+	// connection row and the audit entry. Its own mutex: the watchdog writes
+	// it from a third goroutine, outside both relay legs and outside bookMu.
+	terminationMu sync.Mutex
+	termination   store.Termination
 
 	// watched sits below the counting conn (and below TLS) so an approval
 	// hold can keep reading the client socket while the session goroutine is
@@ -257,6 +300,7 @@ func NewSession(
 		rowWriter:       rowWriter,
 		bytesFromClient: bytesFromClient,
 		bytesToClient:   bytesToClient,
+		connUID:         store.NewConnectionUID(),
 		extendedState: &extendedQueryState{
 			preparedStatements: make(map[string]*preparedStatement),
 			portals:            make(map[string]*portalState),
@@ -295,8 +339,12 @@ func (s *Session) Run() error {
 
 	// s.grant is always set here: authenticate() returns an error (aborting
 	// Run before this point) whenever GetActiveGrant fails.
+	//
+	// WithUID pins the row to s.connUID, generated in NewSession before
+	// connectUpstream ran — the upstream application_name is already tagged
+	// with it by the time this insert happens.
 	conn, err := s.store.CreateConnection(s.ctx, s.user.UID, s.database.UID, sourceIP,
-		store.WithUpstreamTLS(s.upstreamTLS), store.WithGrantUID(s.grant.UID))
+		store.WithUID(s.connUID), store.WithUpstreamTLS(s.upstreamTLS), store.WithGrantUID(s.grant.UID))
 	if err != nil {
 		s.logger.ErrorContext(s.ctx, "failed to create connection record", slog.Any("error", err))
 	} else {
@@ -397,13 +445,20 @@ func (s *Session) proxyMessages() error {
 	// deregistered in cleanup.
 	s.revocation = s.store.Revocations().Register(s.grant.UID)
 
+	// And register it by connection uid, which is the only identifier an admin
+	// has: that is what POST /connections/{uid}/terminate — and the poller
+	// relaying such a request from another replica — signals.
+	s.liveSession = s.store.Sessions().Register(s.connectionUID)
+
 	// Build the limit guard once the grant is known, then run a watchdog that
 	// tears the session down if a limit is crossed (or the grant is revoked)
 	// while a query is blocked producing no traffic (the inline check in
 	// proxyUpstreamToClient handles the actively-streaming case with a clean
 	// error frame).
 	s.guard = shared.NewLimitGuard(s.grant, s.bytesFromClient, s.bytesToClient).
-		WithRevocation(s.revocation.Flag())
+		WithRevocation(s.revocation.Flag()).
+		WithTermination(s.liveSession).
+		WithStatementTimeout(s.statementLimit, shared.StatementTimeoutGrace, &s.statementClock)
 
 	// The approval gate compiles the grant's patterns once, here, so the
 	// per-statement cost of the (overwhelmingly common) no-pattern case is a
@@ -455,10 +510,130 @@ func (s *Session) proxyMessages() error {
 // blocked without producing traffic) can only be terminated this way — there is
 // no message boundary at which to inject a clean ErrorResponse.
 func (s *Session) onLimitViolation(err error) {
-	s.logger.WarnContext(s.ctx, "terminating session: grant no longer valid mid-stream",
+	s.logger.WarnContext(s.ctx, "terminating session: limit crossed mid-stream",
 		slog.Any("error", err))
 
+	s.noteTermination(err)
+
+	// Complete the in-flight statement's row before the sockets go: once they
+	// are closed the relays unwind and nothing else knows which statement was
+	// running.
+	s.persistTerminatedQuery(s.recordedTermination())
+
+	// Cancel upstream *before* closing the sockets. Closing them is not
+	// enough on PostgreSQL: a backend in a long sequential scan does not
+	// notice a dead client until it next tries to send, and
+	// client_connection_check_interval defaults to 0, so it never checks — the
+	// scan runs to completion, which is precisely the load this exists to
+	// stop.
+	s.cancelUpstreamStatement()
+
 	s.closeConns()
+}
+
+// noteTermination records why dbbat is ending this session, for the connection
+// row, the audit entry and the stream event cleanup writes. First writer wins:
+// a second violation observed during teardown must not overwrite the reason
+// that actually caused it.
+func (s *Session) noteTermination(err error) {
+	t := shared.TerminationFor(err, s.guard, s.inFlightQueryUID())
+	if !t.Set() {
+		return
+	}
+
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	if !s.termination.Set() {
+		s.termination = t
+	}
+}
+
+// recordedTermination returns the termination reason, if any.
+func (s *Session) recordedTermination() store.Termination {
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	return s.termination
+}
+
+// inFlightQueryUID is the uid of the statement currently running upstream, when
+// one is already persisted (an approval hold or a started result capture gave
+// it a uid). uuid.Nil otherwise — most statements are only inserted when they
+// finish, and a terminated one never does.
+func (s *Session) inFlightQueryUID() uuid.UUID {
+	s.bookMu.Lock()
+	defer s.bookMu.Unlock()
+
+	q := s.getCurrentPendingQuery()
+	if q == nil {
+		return uuid.Nil
+	}
+
+	return q.approvalUID
+}
+
+// cancelUpstreamStatement sends a PostgreSQL CancelRequest for this session's
+// upstream backend, on a fresh connection through the same dial path (SSH
+// bastion / Kubernetes tunnel included). Best effort with a short deadline: it
+// runs on the watchdog goroutine, immediately before the sockets are closed, so
+// it must never be what delays the teardown.
+func (s *Session) cancelUpstreamStatement() {
+	if s.upstreamKey == nil || s.database == nil {
+		return
+	}
+
+	if !s.statementClock.Running() {
+		// Nothing is executing upstream; the socket close is the whole
+		// teardown and a cancel would name a backend that is already idle.
+		return
+	}
+
+	err := upstream.CancelPostgres(s.ctx, s.dialUpstream, s.database.SSLMode, s.database.Host, s.upstreamKey)
+	if err != nil {
+		s.logger.WarnContext(s.ctx, "failed to cancel the upstream statement",
+			slog.Any("error", err))
+
+		return
+	}
+
+	s.logger.InfoContext(s.ctx, "canceled the upstream statement",
+		slog.String("database", s.database.Name))
+}
+
+// refreshStatementClock points the session's statement clock at the oldest
+// statement still executing upstream, or clears it when none is.
+//
+// Recomputed from the bookkeeping rather than incremented and decremented: the
+// extended protocol can have several statements in flight at once, and the
+// oldest is the one the limit is about. A later statement must never reset the
+// clock and hide an older one that is already over.
+//
+// Callers hold bookMu.
+func (s *Session) refreshStatementClock() {
+	oldest := time.Time{}
+
+	if s.currentQuery != nil {
+		oldest = s.currentQuery.startTime
+	}
+
+	if s.extendedState == nil {
+		s.statementClock.Rearm(oldest)
+
+		return
+	}
+
+	for _, q := range s.extendedState.pendingQueries {
+		if q == nil {
+			continue
+		}
+
+		if oldest.IsZero() || q.startTime.Before(oldest) {
+			oldest = q.startTime
+		}
+	}
+
+	s.statementClock.Rearm(oldest)
 }
 
 // closeConns drops both sockets, which is how a session is ended from outside
@@ -687,8 +862,11 @@ func (s *Session) getCurrentPendingQuery() *pendingQuery {
 		return s.currentQuery
 	}
 
-	// Extended Query Protocol - return the most recent pending query
-	if len(s.extendedState.pendingQueries) > 0 {
+	// Extended Query Protocol - return the most recent pending query.
+	// extendedState is nil in the unit contexts that drive a session without
+	// running its startup, and the watchdog reaches this from a third
+	// goroutine, so the nil check is not theoretical.
+	if s.extendedState != nil && len(s.extendedState.pendingQueries) > 0 {
 		return s.extendedState.pendingQueries[len(s.extendedState.pendingQueries)-1]
 	}
 
@@ -954,6 +1132,12 @@ func (s *Session) proxyUpstreamToClient() error {
 			}
 		}
 
+		// Whatever the message did to the bookkeeping, the set of statements
+		// executing upstream may have changed — a CommandComplete popped one,
+		// a ReadyForQuery finished one. Recompute rather than trying to name
+		// every branch that moved it.
+		s.refreshStatementClock()
+
 		s.bookMu.Unlock()
 
 		// Forward message to client (send as backend message to client)
@@ -1043,7 +1227,7 @@ func (s *Session) abortStream(cause error) {
 	// streamed are live in the CountingConn atomics but never persisted, so a
 	// reconnect recomputes BytesTransferred without them and the cumulative cap
 	// can be bypassed across short-lived connections.
-	s.persistAbortedQuery(cause)
+	s.persistAbortedQuery("aborted: " + cause.Error())
 }
 
 // persistAbortedQuery logs the query cut off by abortStream as a failed query
@@ -1052,7 +1236,7 @@ func (s *Session) abortStream(cause error) {
 // bytes are included in the attribution).
 //
 // Callers hold bookMu (see enforceStreamLimits).
-func (s *Session) persistAbortedQuery(cause error) {
+func (s *Session) persistAbortedQuery(errText string) {
 	query := s.getCurrentPendingQuery()
 	if query == nil {
 		return
@@ -1085,18 +1269,49 @@ func (s *Session) persistAbortedQuery(cause error) {
 		s.currentQuery = query
 	}
 
-	errMsg := "aborted: " + cause.Error()
-	s.logQuery(nil, &errMsg, bytesTransferred)
+	s.logQuery(nil, &errText, bytesTransferred)
+}
+
+// persistTerminatedQuery completes the statement that was in flight when the
+// watchdog tore the session down, with an error naming the limit that was
+// crossed. Without it the queries page shows the statement that caused the
+// termination as one that is still running, which is the one row an operator
+// looks for afterwards.
+//
+// Runs on the watchdog goroutine, before the sockets are closed, so the relay
+// legs are still alive and the bookkeeping is still coherent.
+func (s *Session) persistTerminatedQuery(t store.Termination) {
+	if !t.Set() {
+		return
+	}
+
+	message := t.Message()
+
+	s.bookMu.Lock()
+	defer s.bookMu.Unlock()
+
+	s.persistAbortedQuery(message)
 }
 
 // cleanup closes connections and updates records.
 func (s *Session) cleanup() {
 	s.releaseCancelKey()
+
+	// "terminated" before "closed": a watcher should learn *why* the session
+	// ended before it learns that it did, so the connections page can label
+	// the row instead of showing one that merely vanished.
+	termination := s.recordedTermination()
+	if termination.Set() {
+		s.stream.ConnectionWithReason(s.ctx, shared.ConnectionTerminated, termination.Reason)
+	}
+
 	s.stream.Connection(s.ctx, shared.ConnectionClosed)
 
 	if s.grant != nil && s.revocation != nil {
 		s.store.Revocations().Deregister(s.grant.UID, s.revocation)
 	}
+
+	s.store.Sessions().Deregister(s.connectionUID, s.liveSession)
 
 	if s.dumpWriter != nil {
 		if err := s.dumpWriter.Close(); err != nil {
@@ -1109,7 +1324,7 @@ func (s *Session) cleanup() {
 	}
 
 	if s.connectionUID != uuid.Nil {
-		if err := s.store.CloseConnection(s.ctx, s.connectionUID); err != nil {
+		if err := s.store.CloseConnectionWithReason(s.ctx, s.connectionUID, termination); err != nil {
 			s.logger.ErrorContext(s.ctx, "failed to close connection record", slog.Any("error", err))
 		}
 	}

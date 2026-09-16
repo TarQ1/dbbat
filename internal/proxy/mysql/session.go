@@ -51,6 +51,13 @@ type Session struct {
 	// DBBat connection record (insert on connect, close on disconnect).
 	connection *store.Connection
 
+	// connUID is generated up front (store.NewConnectionUID), before
+	// connectUpstream runs, so the upstream program_name can be tagged with
+	// it (shared.BuildUpstreamName's "c=" field) before the row backing it
+	// exists. recordConnection pins the row to this exact value via
+	// store.WithUID.
+	connUID uuid.UUID
+
 	// Optional packet dump for the post-auth phase (matches PG behavior).
 	dumpWriter *dump.Writer
 
@@ -73,9 +80,39 @@ type Session struct {
 	// force-closes both conns.
 	guard *shared.LimitGuard
 
+	// statementLimit is this session's resolved value (0 = no limit), stamped
+	// at auth; statementClock marks the statement currently executing upstream.
+	statementLimit time.Duration
+	statementClock shared.StatementClock
+
+	// queryTag prepends the dbbat identity comment to the statement text handed
+	// to the upstream — COM_QUERY and COM_STMT_PREPARE, never the binary
+	// COM_STMT_EXECUTE, which carries no text. Built at auth from the server's
+	// DBB_QUERY_TAGGING setting; its zero value is inert, so every call site is
+	// unconditional and the disabled path changes nothing.
+	queryTag shared.QueryTagger
+
+	// upstreamConnID / upstreamVersion are the backend's own connection id and
+	// version banner, captured at connect. The id is what KILL QUERY names when
+	// the watchdog cancels a runaway statement; the banner is what tells MySQL
+	// from MariaDB, which spell the per-statement limit differently.
+	upstreamConnID  uint32
+	upstreamVersion string
+
+	// termination records why dbbat ended this session, when dbbat is what
+	// ended it. Written by the watchdog from a goroutine of its own, read by
+	// recordDisconnect — hence the mutex.
+	terminationMu sync.Mutex
+	termination   store.Termination
+
 	// revocation is signaled when this session's grant is revoked mid-flight,
 	// so the next command is rejected and the watchdog tears the session down.
 	revocation *cache.RevocationHandle
+	// liveSession is signaled when an admin ends *this* session. Registered in
+	// recordConnection rather than next to the revocation handle at auth,
+	// because it is keyed by the connection uid, which does not exist until the
+	// row does.
+	liveSession *cache.SessionHandle
 
 	// watched sits below the counting conn so an approval hold can keep
 	// reading the client socket while the command goroutine is parked.
@@ -150,6 +187,7 @@ func newSession(clientConn net.Conn, server *Server) *Session {
 		bytesToClient:   bytesToClient,
 		logger:          server.logger,
 		ctx:             server.ctx,
+		connUID:         store.NewConnectionUID(),
 	}
 }
 
@@ -262,7 +300,7 @@ func (s *Session) Run() error {
 	// exactly how onLimitViolation enforces.
 	go safe.RunWatchdog(watchCtx, s.logger, goroutineNameWatchdog, func() {
 		s.guard.Watch(watchCtx, shared.DefaultLimitPollInterval, func(err error) {
-			s.onLimitViolation(upstreamConn, clientConn, err)
+			s.onLimitViolation(watchCtx, upstreamConn, clientConn, err)
 		})
 	}, func() {
 		closeSessionConns(upstreamConn, clientConn)
@@ -290,11 +328,46 @@ func (s *Session) Run() error {
 // teardown race-free. Close is safe to call concurrently with a blocked
 // Read/Write and safe to call twice (the deferred closeUpstream closes the same
 // conn).
-func (s *Session) onLimitViolation(upstreamConn, clientConn io.Closer, err error) {
-	s.logger.WarnContext(s.ctx, "terminating MySQL session: grant no longer valid mid-stream",
+func (s *Session) onLimitViolation(ctx context.Context, upstreamConn, clientConn io.Closer, err error) {
+	s.logger.WarnContext(ctx, "terminating MySQL session: limit crossed mid-stream",
 		slog.Any("error", err))
 
+	s.noteTermination(err)
+
+	// Kill upstream first, close second. A KILL QUERY needs the upstream
+	// credentials and a reachable target, both of which are still true here;
+	// after the close there is still a server-side thread running the statement
+	// nobody is reading any more.
+	if s.statementClock.Running() {
+		s.killUpstreamStatement(ctx)
+	}
+
 	closeSessionConns(upstreamConn, clientConn)
+}
+
+// noteTermination records why dbbat is ending this session. First writer wins:
+// a second violation observed during teardown must not overwrite the reason
+// that actually caused it.
+func (s *Session) noteTermination(err error) {
+	t := shared.TerminationFor(err, s.guard, s.heldQuery())
+	if !t.Set() {
+		return
+	}
+
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	if !s.termination.Set() {
+		s.termination = t
+	}
+}
+
+// recordedTermination returns the termination reason, if any.
+func (s *Session) recordedTermination() store.Termination {
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	return s.termination
 }
 
 // closeSessionConns force-closes both conns, which is the enforcement mechanism
@@ -342,6 +415,10 @@ func (s *Session) recordConnection() error {
 		s.user.UID,
 		s.database.UID,
 		store.ExtractSourceIP(s.clientConn.RemoteAddr()),
+		// s.connUID was generated in newSession, before connectUpstream
+		// tagged the upstream program_name with it — pin the row to the
+		// same value rather than letting CreateConnection mint its own.
+		store.WithUID(s.connUID),
 		store.WithUpstreamTLS(s.upstreamTLS),
 		// s.grant is always set by the time OnAuthSuccess calls into
 		// recordConnection: it returns an error whenever GetActiveGrant fails.
@@ -352,6 +429,13 @@ func (s *Session) recordConnection() error {
 	}
 
 	s.connection = conn
+
+	// Now that the session has a uid an admin can name, register it and let the
+	// guard watch the flag. Still on the connection's own goroutine, before Run
+	// starts the watchdog, so attaching to the already-built guard races
+	// nothing.
+	s.liveSession = s.server.store.Sessions().Register(conn.UID)
+	s.guard.WithTermination(s.liveSession)
 
 	dbName := ""
 	if s.database != nil {
@@ -367,8 +451,13 @@ func (s *Session) recordConnection() error {
 }
 
 // deregisterRevocation drops this session's handle from the store's revocation
-// registry. Safe to call when the session never registered (grant nil).
+// registry, and its live-session handle with it. Safe to call when the session
+// never registered either (grant nil, or no connection row).
 func (s *Session) deregisterRevocation() {
+	if s.connection != nil {
+		s.server.store.Sessions().Deregister(s.connection.UID, s.liveSession)
+	}
+
 	if s.grant == nil || s.revocation == nil {
 		return
 	}
@@ -402,7 +491,14 @@ func (s *Session) recordDisconnect() {
 		}
 	}
 
-	if err := s.server.store.CloseConnection(s.ctx, s.connection.UID); err != nil {
+	termination := s.recordedTermination()
+	if termination.Set() {
+		// "terminated" before "closed": a watcher should learn why the session
+		// ended before it learns that it did.
+		s.stream.ConnectionWithReason(s.ctx, shared.ConnectionTerminated, termination.Reason)
+	}
+
+	if err := s.server.store.CloseConnectionWithReason(s.ctx, s.connection.UID, termination); err != nil {
 		s.logger.WarnContext(s.ctx, "MySQL connection close failed",
 			slog.Any("connection_id", s.connection.UID),
 			slog.Any("error", err))

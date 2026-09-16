@@ -162,9 +162,20 @@ func (s *Session) handleClientOpMsg(m *message) error {
 		s.annotateGetMore(pq, body)
 	}
 
+	// The last thing before the command goes upstream: the per-statement
+	// deadline and the dbbat identity tag, both written into the *forwarded*
+	// copy only. Every control above — the grant, the $db check, the quota and
+	// the approval hold — ran on the client's command, and pq.sqlText (which
+	// feeds the queries row and the audit chain) holds the client's command
+	// too. Only the bytes on the wire change.
+	forwarded, terr := s.prepareForwarded(m, parsed, body, cmd)
+	if terr != nil {
+		return s.rejectCommand(m, cmd, body, moreToCome, terr)
+	}
+
 	s.registerPending(m.requestID, pq)
 
-	if err := s.forward(m); err != nil {
+	if err := s.forward(forwarded); err != nil {
 		s.takePending(m.requestID)
 
 		return err
@@ -214,6 +225,7 @@ func (s *Session) forward(m *message) error {
 func (s *Session) registerPending(requestID int32, pq *pendingQuery) {
 	s.pendingMu.Lock()
 	s.pending[requestID] = pq
+	s.refreshStatementClockLocked()
 	s.pendingMu.Unlock()
 }
 
@@ -228,8 +240,135 @@ func (s *Session) takePending(responseTo int32) *pendingQuery {
 	}
 
 	delete(s.pending, responseTo)
+	s.refreshStatementClockLocked()
 
 	return pq
+}
+
+// refreshStatementClockLocked points the session's statement clock at the
+// oldest command still awaiting an upstream reply, or clears it when none is.
+//
+// Recomputed from the pending map rather than incremented and decremented: a
+// driver can pipeline several commands on one connection, and the oldest is the
+// one the limit is about — a later command must never reset the clock and hide
+// an older one that is already over.
+//
+// Callers hold pendingMu.
+func (s *Session) refreshStatementClockLocked() {
+	oldest := time.Time{}
+
+	for _, pq := range s.pending {
+		if pq == nil {
+			continue
+		}
+
+		if oldest.IsZero() || pq.start.Before(oldest) {
+			oldest = pq.start
+		}
+	}
+
+	s.statementClock.Rearm(oldest)
+}
+
+// maxTimeMSExemptCommands are the commands dbbat forwards untouched.
+//
+// They are the handshake, auth and teardown chatter a driver issues on its own:
+// none of them is a statement a user wrote, none can run long, and a couple
+// (killCursors, endSessions, the SASL exchange) are exactly what a driver sends
+// while cleaning up after a command that *was* canceled — putting a deadline
+// on those would turn one timeout into two.
+var maxTimeMSExemptCommands = map[string]bool{
+	"hello":          true,
+	"ismaster":       true,
+	"isMaster":       true,
+	"ping":           true,
+	"buildInfo":      true,
+	"buildinfo":      true,
+	"saslStart":      true,
+	"saslContinue":   true,
+	"logout":         true,
+	"killCursors":    true,
+	"killOperations": true,
+	"endSessions":    true,
+	"getnonce":       true,
+}
+
+// prepareForwarded returns the message to forward: the client's, rewritten by
+// each dbbat-owned command option that applies — the per-statement deadline
+// (maxTimeMS) and the identity tag (`comment`).
+//
+// They compose on the *document* and the message is re-serialized once, rather
+// than each rewriting a message of its own: rebuildOpMsg re-serializes from the
+// sections parsed out of the original body, so feeding it a second time with a
+// message the first pass already rebuilt would silently drop that pass's work.
+//
+// A command no rewrite touches is forwarded as the very bytes that arrived,
+// pointer included.
+func (s *Session) prepareForwarded(m *message, parsed *opMsg, body bson.Raw, cmd string) (*message, error) {
+	rewritten := body
+	changed := false
+
+	next, ok, err := s.applyMaxTimeMS(rewritten, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
+		rewritten, changed = next, true
+	}
+
+	next, ok, err = s.applyQueryTag(rewritten, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
+		rewritten, changed = next, true
+	}
+
+	if !changed {
+		return m, nil
+	}
+
+	raw, err := rebuildOpMsg(m, parsed, rewritten)
+	if err != nil {
+		return nil, err
+	}
+
+	return &message{
+		length:     int32(len(raw)),
+		requestID:  m.requestID,
+		responseTo: m.responseTo,
+		opCode:     m.opCode,
+		body:       raw[headerLen:],
+		raw:        raw,
+	}, nil
+}
+
+// applyMaxTimeMS returns the command body with the grant's per-statement limit
+// injected as maxTimeMS when one applies, and reports whether it changed.
+//
+// This is the MongoDB half of layer 1 — the polite, server-side cancellation
+// that gives the client a real MaxTimeMSExpired error and keeps its session
+// alive. The watchdog behind it is unchanged: a client that finds a way past
+// this still meets it.
+//
+// A client value at or below the limit wins; a larger one (or the 0 that means
+// "no limit") is clamped. Clamped rather than refused: unlike a SQL `SET`,
+// maxTimeMS is an ordinary per-command option every driver sets for its own
+// reasons, and refusing it would break clients that are asking for *less* than
+// dbbat is about to impose.
+func (s *Session) applyMaxTimeMS(body bson.Raw, cmd string) (bson.Raw, bool, error) {
+	if s.statementLimit <= 0 || maxTimeMSExemptCommands[cmd] {
+		return body, false, nil
+	}
+
+	limitMS := s.statementLimit.Milliseconds()
+	if limitMS <= 0 {
+		return body, false, nil
+	}
+
+	return withMaxTimeMS(body, limitMS)
 }
 
 // pendingCommand returns the command name of the in-flight query for responseTo

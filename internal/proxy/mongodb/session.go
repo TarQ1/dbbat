@@ -84,6 +84,19 @@ type Session struct {
 	// connection is the DBBat audit record (insert on auth, close on teardown).
 	connection *store.Connection
 
+	// connUID is generated up front (store.NewConnectionUID), before
+	// connectUpstream runs, so the upstream hello's application.name can be
+	// tagged with it (shared.BuildUpstreamName's "c=" field) before the row
+	// backing it exists. recordConnection pins the row to this exact value
+	// via store.WithUID.
+	connUID uuid.UUID
+
+	// clientApplicationName is the client's own hello/isMaster
+	// client.application.name, captured in helloDoc — the MongoDB
+	// counterpart of PostgreSQL's clientApplicationName (session.go). Folded
+	// into the upstream-facing name in place of the "" dbbat used to send.
+	clientApplicationName string
+
 	// dumpWriter captures post-auth framed traffic (plaintext) when enabled.
 	dumpWriter *dump.Writer
 	dumpMu     sync.Mutex
@@ -95,8 +108,29 @@ type Session struct {
 
 	// guard enforces the grant's time-window / bandwidth limits mid-stream.
 	guard *shared.LimitGuard
+
+	// statementLimit is this session's resolved value (0 = no limit), stamped
+	// at auth; statementClock marks the oldest command awaiting a reply.
+	statementLimit time.Duration
+	statementClock shared.StatementClock
+
+	// queryTag carries the dbbat identity into the `comment` field of the
+	// commands forwarded upstream (querytag.go). Built once at auth, because
+	// every component of it is known exactly then and none changes afterwards.
+	// Left at its inert zero value when DBB_QUERY_TAGGING is off.
+	queryTag shared.QueryTagger
+
+	// termination records why dbbat ended this session, when dbbat is what
+	// ended it. Written by the watchdog goroutine, read by the teardown.
+	terminationMu sync.Mutex
+	termination   store.Termination
 	// revocation is signaled when this session's grant is revoked mid-flight.
 	revocation *cache.RevocationHandle
+	// liveSession is signaled when an admin ends *this* session. Registered in
+	// recordConnection rather than in establishSession with the revocation
+	// handle, because it is keyed by the connection uid, which does not exist
+	// until the row does.
+	liveSession *cache.SessionHandle
 
 	// pending correlates upstream replies to the query that produced them
 	// (phase 3). Keyed by the client requestID.
@@ -137,6 +171,15 @@ func (s *Session) setHeldQuery(uid uuid.UUID) {
 	s.heldMu.Unlock()
 }
 
+// heldQuery is the uid of the command currently parked on a human, uuid.Nil
+// when nothing is.
+func (s *Session) heldQuery() uuid.UUID {
+	s.heldMu.Lock()
+	defer s.heldMu.Unlock()
+
+	return s.heldQueryUID
+}
+
 // KillHeldQuery ends a command parked on a human, in response to a MongoDB
 // killOperations. Reports whether anything was parked.
 func (s *Session) KillHeldQuery() bool {
@@ -174,6 +217,7 @@ func newSession(rawConn net.Conn, server *Server) *Session {
 		cursorOrigins:   make(map[int64]cursorOrigin),
 		logger:          server.logger,
 		ctx:             server.ctx,
+		connUID:         store.NewConnectionUID(),
 	}
 	s.replyReqID.Store(preAuthReplyRequestIDBase)
 
@@ -342,6 +386,8 @@ func (s *Session) dispatchPreAuthOpQuery(m *message) (bool, error) {
 	name := commandName(q.query)
 	switch name {
 	case "hello", "isMaster", "ismaster":
+		s.clientApplicationName = clientAppNameFromHello(q.query)
+
 		reply, err := buildOpReply(s.nextReplyID(), m.requestID, s.helloDoc(name, q.query))
 		if err != nil {
 			return false, err
@@ -370,6 +416,8 @@ func (s *Session) dispatchPreAuthOpMsg(m *message) (bool, error) {
 	name := commandName(body)
 	switch name {
 	case "hello", "isMaster", "ismaster":
+		s.clientApplicationName = clientAppNameFromHello(body)
+
 		return false, s.replyOpMsg(m.requestID, s.helloDoc(name, body))
 	case "ping":
 		return false, s.replyOpMsg(m.requestID, okDoc())
@@ -559,10 +607,40 @@ func (s *Session) cumulativeClientBytes() int64 {
 
 // onLimitViolation force-closes both conns when the watchdog trips.
 func (s *Session) onLimitViolation(up *UpstreamConn, clientConn io.Closer, err error) {
-	s.logger.WarnContext(s.ctx, "terminating MongoDB session: grant no longer valid mid-stream",
+	s.logger.WarnContext(s.ctx, "terminating MongoDB session: limit crossed mid-stream",
 		slog.Any("error", err))
 
+	s.noteTermination(err)
+
+	// No upstream cancel to send: killOp needs privileges the proxied role
+	// usually lacks, and asking for them would widen what dbbat's stored
+	// credentials can do on every deployment, to buy a cancel the injected
+	// maxTimeMS already performs on the server's own side. The injection *is*
+	// the cancel on this protocol; the socket close is the backstop.
 	closeSessionConns(up, clientConn)
+}
+
+// noteTermination records why dbbat is ending this session. First writer wins.
+func (s *Session) noteTermination(err error) {
+	t := shared.TerminationFor(err, s.guard, s.heldQuery())
+	if !t.Set() {
+		return
+	}
+
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	if !s.termination.Set() {
+		s.termination = t
+	}
+}
+
+// recordedTermination returns the termination reason, if any.
+func (s *Session) recordedTermination() store.Termination {
+	s.terminationMu.Lock()
+	defer s.terminationMu.Unlock()
+
+	return s.termination
 }
 
 // closeSessionConns drops both sockets, which is how a session is ended from
@@ -591,6 +669,11 @@ func (s *Session) recordConnection() error {
 		s.user.UID,
 		s.database.UID,
 		store.ExtractSourceIP(s.clientConn.RemoteAddr()),
+		// s.connUID was generated in newSession, before connectUpstream
+		// tagged the upstream hello's application.name with it — pin the
+		// row to the same value rather than letting CreateConnection mint
+		// its own.
+		store.WithUID(s.connUID),
 		store.WithUpstreamTLS(s.upstreamTLS),
 		// s.grant is always set here: establishSession only clears it (on an
 		// upstream-dial failure) along a path that returns before calling
@@ -602,6 +685,13 @@ func (s *Session) recordConnection() error {
 	}
 
 	s.connection = conn
+
+	// Now that the session has a uid an admin can name, register it and let
+	// the guard watch the flag. Still on the auth goroutine, before relay
+	// starts the watchdog, so attaching to the already-built guard races
+	// nothing.
+	s.liveSession = s.server.store.Sessions().Register(conn.UID)
+	s.guard.WithTermination(s.liveSession)
 
 	dbName := ""
 	if s.database != nil {
@@ -616,8 +706,16 @@ func (s *Session) recordConnection() error {
 	return nil
 }
 
-// deregisterRevocation drops this session's revocation handle.
+// deregisterRevocation drops this session's revocation handle, and its
+// live-session handle with it: both are registered on the way in and must go on
+// the way out, including along the upstream-dial failure path that calls this
+// before a connection row ever exists (where the handle is nil and the
+// registry's nil-safety makes the call a no-op).
 func (s *Session) deregisterRevocation() {
+	if s.connection != nil {
+		s.server.store.Sessions().Deregister(s.connection.UID, s.liveSession)
+	}
+
 	if s.grant == nil || s.revocation == nil {
 		return
 	}
@@ -644,7 +742,18 @@ func (s *Session) recordDisconnect() {
 		}
 	}
 
-	if err := s.server.store.CloseConnection(s.ctx, s.connection.UID); err != nil {
+	termination := s.recordedTermination()
+	if termination.Set() {
+		// The commands still awaiting a reply never get one, so nothing else
+		// will complete their rows. Say why here, before the session record
+		// closes. Plural: a driver can pipeline several on one connection.
+		s.flushPendingOnTermination(termination)
+
+		// "terminated" before "closed": why, then that.
+		s.stream.ConnectionWithReason(s.ctx, shared.ConnectionTerminated, termination.Reason)
+	}
+
+	if err := s.server.store.CloseConnectionWithReason(s.ctx, s.connection.UID, termination); err != nil {
 		s.logger.WarnContext(s.ctx, "MongoDB connection close failed",
 			slog.Any("connection_id", s.connection.UID),
 			slog.Any("error", err))
@@ -742,4 +851,29 @@ func (p *prefixConn) Read(b []byte) (int, error) {
 	}
 
 	return p.Conn.Read(b)
+}
+
+// flushPendingOnTermination records every command that was still awaiting an
+// upstream reply when dbbat ended the session, with the reason it ended.
+func (s *Session) flushPendingOnTermination(t store.Termination) {
+	s.pendingMu.Lock()
+
+	pending := make([]*pendingQuery, 0, len(s.pending))
+
+	for requestID, pq := range s.pending {
+		if pq != nil {
+			pending = append(pending, pq)
+		}
+
+		delete(s.pending, requestID)
+	}
+
+	s.statementClock.Stop()
+	s.pendingMu.Unlock()
+
+	message := t.Message()
+
+	for _, pq := range pending {
+		s.recordQuery(pq, nil, nil, &message)
+	}
 }

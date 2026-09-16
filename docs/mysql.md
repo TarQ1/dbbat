@@ -344,6 +344,73 @@ If the test fails after a `go.mod` upgrade: either pin go-mysql back, or extend 
 
 When `DBB_DUMP_DIR` is set, the MySQL proxy writes a per-session `.pcapng` capture file containing the post-auth command-phase byte stream (matching the PG and Oracle proxies). The filename is the connection UID. Wiring is in `session.go: startDumpIfConfigured` — it swaps the underlying `net.Conn` on the live `packet.Conn` for a `dump.TapConn` after `recordConnection` runs, so the auth handshake itself is never captured. For TLS-upgraded connections the tap sees TLS records, which still preserves timing and packet boundaries.
 
+## Finding a session from performance_schema
+
+Every proxied session's `program_name` connect attribute is dbbat-branded and
+carries the connection's own uid, not just the dbbat user's:
+
+```sql
+SELECT p.ID, a.ATTR_VALUE AS program_name, p.INFO
+FROM performance_schema.processlist p
+JOIN performance_schema.session_connect_attrs a
+  ON a.PROCESSLIST_ID = p.ID AND a.ATTR_NAME = 'program_name'
+WHERE a.ATTR_VALUE LIKE 'dbbat/%';
+```
+
+`program_name` reads `dbbat/0.28.1 @florent c=3f9a1c7b2e4d for mysql` — the
+`c=` tag is the last 12 hex characters of the connection uid. Paste it (or the
+whole `c=...` token) into the connections page's search box, or call
+`GET /api/v1/connections?uid_suffix=3f9a1c7b2e4d` directly, to land on the
+exact dbbat connection: its queries, its grant, and the Terminate button —
+rather than guessing from the username alone, which is ambiguous the moment a
+user has more than one session open.
+
+## Statement tagging (`DBB_QUERY_TAGGING`)
+
+`program_name` above answers "which dbbat session is this?", but the slow
+query log and `performance_schema.events_statements_*` show statement text,
+not connect attributes — and every dbbat session logs in to the target as the
+same shared MySQL account from the same host (the proxy). With
+`DBB_QUERY_TAGGING=true`, dbbat prepends a
+[sqlcommenter](https://google.github.io/sqlcommenter/)-style comment to every
+statement it forwards:
+
+```sql
+/*dbbat='0.28.1',user='florent',conn='3f9a1c7b2e4d',grant='diag-paris-habitat'*/ SELECT ...
+```
+
+`conn=` is the same 12 hex characters as `program_name`'s `c=` tag, so it
+feeds the same `GET /api/v1/connections?uid_suffix=` lookup. Off by default —
+it changes the bytes the server receives.
+
+**Where it is applied.** `COM_QUERY` and `COM_STMT_PREPARE`. `COM_STMT_EXECUTE`
+is a binary payload with no statement text at all, and needs none: it runs the
+statement prepared (and tagged) by its `COM_STMT_PREPARE`, so the tag is
+already in `performance_schema`'s `SQL_TEXT` for it. The text-protocol
+`PREPARE ... FROM '<literal>'` / `EXECUTE <name>` pair is tagged on its outer
+statement, like anything else sent as `COM_QUERY`.
+
+**What it does not change.** The `queries` table, the tamper-evident audit
+chain and the UI's query-text search all hold the **client's** statement,
+untagged; every control — `read_only`, `block_ddl`, `block_copy`, the
+database-switch scan, the dynamic-SQL checks, approval-hold patterns — runs on
+the client's text, before tagging; and dbbat's own `.pcapng` captures tap the
+client leg, so the tag does not appear in them either.
+
+**`max_allowed_packet`.** The tag is roughly 90 bytes. A statement that was
+already within ~90 bytes of the server's `max_allowed_packet` will now be
+rejected with tagging on where it previously squeaked through. There is no
+special handling: the limit is the server's, and raising it (or leaving
+tagging off) is the operator's call.
+
+**Known limit: the digest.** MySQL's statement digest normalises comments
+away, so the digest itself is unaffected and repeated executions keep
+aggregating — which is exactly why the tag carries no timestamp and no
+per-statement id. The *sample* text stored alongside a digest
+(`events_statements_summary_by_digest.QUERY_SAMPLE_TEXT`) is one execution's,
+so its tag names whichever session produced that sample rather than all of
+them. `events_statements_current`/`_history` and the slow log are exact.
+
 ## Testing
 
 ### Integration tests
@@ -385,3 +452,35 @@ Tested clients (CI matrix):
 | MariaDB CLI | mariadb 10.x | manual smoke test |
 
 For protocol debugging, set `DBB_LOG_LEVEL=debug` to see incoming MySQL commands and forwarded packets.
+
+## Per-statement time limits
+
+**Layer 1** differs by dialect, and neither server accepts the other's name, so
+picking wrong means the session fails to start:
+
+- **MySQL**: `SET SESSION max_execution_time = <ms>`. It only covers read-only
+  `SELECT`s — every other statement is the watchdog's problem, which is why
+  this layer is defense in depth rather than the enforcement.
+- **MariaDB**: `SET SESSION max_statement_time = <seconds>` (fractional
+  allowed), which covers more than `SELECT`. MariaDB is detected from the
+  handshake version banner (`…-MariaDB…`); there is no capability flag for it.
+
+The `SET` is issued immediately after `upstream.ConnectMySQL`, on the
+`*client.Conn` the connector returns. It failing is fatal to the session: a
+session that could not be pinned would look bounded and not be.
+
+A statement that would change it is refused next to the grant controls in
+`runIntercepted`: `SET [SESSION|GLOBAL|PERSIST|…] max_execution_time` /
+`max_statement_time` in either `@@`-qualified or bare form. The
+`/*+ MAX_EXECUTION_TIME(n) */` optimizer hint is treated differently — a value
+*at or below* the limit is allowed, since a client narrowing its own deadline is
+the behaviour the limit is trying to encourage; a larger one, or the `0` MySQL
+reads as "no limit", is refused. The hint is matched on the **raw** SQL: it
+lives inside a comment, which normalization strips.
+
+**Layer 2**, the watchdog, cancels with **`KILL QUERY <upstream connection id>`**
+on a fresh upstream connection — the one running the statement is not reading
+its socket. The id is `conn.GetConnectionID()`, captured at connect so the
+teardown does not race `closeUpstream` nilling the conn. The kill is sent
+*before* the sockets are closed: after the close there is still a server-side
+thread running a statement nobody will read.

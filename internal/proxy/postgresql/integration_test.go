@@ -27,8 +27,10 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/fclairamb/dbbat/internal/approval"
 	"github.com/fclairamb/dbbat/internal/config"
 	"github.com/fclairamb/dbbat/internal/crypto"
+	"github.com/fclairamb/dbbat/internal/proxy/shared"
 	"github.com/fclairamb/dbbat/internal/proxy/testsupport"
 	"github.com/fclairamb/dbbat/internal/store"
 )
@@ -189,8 +191,16 @@ func selfSignedCert(t *testing.T) ([]byte, []byte) {
 // fixture wires up: a storage container + dbbat store, a user/database/grant,
 // an upstream PostgreSQL container, and a started proxy.
 type fixture struct {
-	t            *testing.T
-	store        *store.Store
+	t     *testing.T
+	store *store.Store
+	// approvals is the registry a parked statement is released through, or nil
+	// when the fixture was built without approval patterns.
+	approvals *approval.Registry
+	// storeDSN is the storage database this fixture's store is connected to,
+	// so a test can open a *second* handle onto it — which is how the
+	// cross-instance paths are exercised: a second handle mints its own run id,
+	// so it can never be the in-process fast path that did the work.
+	storeDSN     string
 	proxy        *Server
 	proxyAddr    string
 	user         *store.User
@@ -214,6 +224,12 @@ type fixtureOpts struct {
 	tlsUpstream bool
 	// sslMode is the server row's ssl_mode (defaults to "disable").
 	sslMode string
+	// approvalPatterns, when non-empty, puts RE2 approval-hold patterns on the
+	// grant definition *and* wires the proxy's approval collaborators — the
+	// two halves of a live hold. Installed before Start, because
+	// Server.approvalDeps is a plain field the accept loop reads and these
+	// suites run under -race.
+	approvalPatterns []string
 }
 
 func setupFixtureWithDumpDir(ctx context.Context, t *testing.T, dumpDir string) *fixture {
@@ -288,7 +304,8 @@ func setupFixtureWith(ctx context.Context, t *testing.T, opts fixtureOpts) *fixt
 	}, encKey)
 	require.NoError(t, err)
 
-	_, err = testsupport.CreateGrantWithControls(ctx, t, dataStore, user.UID, db.UID, []string{})
+	_, err = testsupport.CreateGrantWithControls(ctx, t, dataStore, user.UID, db.UID, []string{},
+		testsupport.WithApprovalPatterns(opts.approvalPatterns...))
 	require.NoError(t, err)
 
 	queryStorage := config.QueryStorageConfig{
@@ -309,6 +326,20 @@ func setupFixtureWith(ctx context.Context, t *testing.T, opts fixtureOpts) *fixt
 	proxy, err := NewServer(dataStore, encKey, queryStorage, dumpCfg, nil, config.PGConfig{}, slog.Default())
 	require.NoError(t, err)
 
+	var approvals *approval.Registry
+
+	if len(opts.approvalPatterns) > 0 {
+		approvals = approval.NewRegistry()
+
+		proxy.SetApprovalDeps(shared.ApprovalDeps{
+			Enabled:      true,
+			Store:        dataStore,
+			Registry:     approvals,
+			Logger:       slog.Default(),
+			PollInterval: 200 * time.Millisecond,
+		})
+	}
+
 	go func() { _ = proxy.Start("127.0.0.1:0") }()
 
 	t.Cleanup(func() {
@@ -323,6 +354,8 @@ func setupFixtureWith(ctx context.Context, t *testing.T, opts fixtureOpts) *fixt
 	return &fixture{
 		t:            t,
 		store:        dataStore,
+		approvals:    approvals,
+		storeDSN:     storeDSN,
 		proxy:        proxy,
 		proxyAddr:    proxy.Addr().String(),
 		user:         user,
@@ -950,4 +983,32 @@ func TestIntegration_RevocationKillsSession(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return conn.QueryRow(ctx, "SELECT 1").Scan(&got) != nil
 	}, 10*time.Second, 250*time.Millisecond, "revoked session should be torn down")
+}
+
+// TestIntegration_UpstreamApplicationNameCarriesConnectionUID verifies the
+// upstream sees dbbat's branded application_name, tagged with this
+// connection's uid (shared.BuildUpstreamName's "c=" field), so a DBA reading
+// pg_stat_activity can trace a session back to its dbbat connection row.
+func TestIntegration_UpstreamApplicationNameCarriesConnectionUID(t *testing.T) {
+	ctx := context.Background()
+	f := setupFixture(ctx, t)
+
+	conn := f.mustConnect(ctx, fixturePass)
+
+	var appName string
+	require.NoError(t, conn.QueryRow(ctx,
+		"SELECT current_setting('application_name')").Scan(&appName))
+
+	connections, err := f.store.ListConnections(ctx, store.ConnectionFilter{UserID: &f.user.UID})
+	require.NoError(t, err)
+	require.NotEmpty(t, connections, "the connection above must have created a row")
+
+	// ListConnections orders uid DESC (UUIDv7 is time-ordered), so the
+	// just-opened session is first.
+	row := connections[0]
+	hex := strings.ReplaceAll(row.UID.String(), "-", "")
+	wantSuffix := hex[len(hex)-12:]
+
+	assert.True(t, strings.HasPrefix(appName, "dbbat/"), "got %q", appName)
+	assert.Contains(t, appName, "@"+fixtureUser+" c="+wantSuffix)
 }

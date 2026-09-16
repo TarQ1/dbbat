@@ -423,6 +423,29 @@ type Connection struct {
 	Queries          int64      `bun:"queries,notnull,default:0" json:"queries"`
 	BytesTransferred int64      `bun:"bytes_transferred,notnull,default:0" json:"bytes_transferred"`
 
+	// TerminationReason says why *dbbat* ended this session, when dbbat is
+	// what ended it. nil — the ordinary case — means the client or the
+	// network did. Written in the same statement as DisconnectedAt, so a
+	// terminated session can never read back as a clean one.
+	//
+	// The vocabulary is the TerminationReason* constants; anything else is a
+	// bug, not an extension point.
+	TerminationReason *string `bun:"termination_reason" json:"termination_reason,omitempty"`
+
+	// The admin's request to end this session, which is how a terminate
+	// crosses the instance boundary: the replica serving the API call writes
+	// these, and the replica that actually owns the session (connections.run_id)
+	// picks them up on its next poll.
+	//
+	// They are an *intent*, distinct from TerminationReason's record of what
+	// happened: a session can close on its own between the request and the
+	// poll, in which case these stay set and TerminationReason stays nil, and
+	// that is the honest reading of it. TerminateReason is the requesting
+	// admin's free text, never the closed vocabulary.
+	TerminateRequestedAt *time.Time `bun:"terminate_requested_at" json:"terminate_requested_at,omitempty"`
+	TerminateRequestedBy *uuid.UUID `bun:"terminate_requested_by,type:uuid" json:"terminate_requested_by,omitempty"`
+	TerminateReason      *string    `bun:"terminate_reason" json:"terminate_reason,omitempty"`
+
 	// UpstreamTLS reports whether the proxy→upstream leg of this session was
 	// encrypted. The server row's ssl_mode states a policy, not an outcome:
 	// the opportunistic modes ("prefer", and the empty default) fall back to
@@ -575,6 +598,18 @@ type ConnectionFilter struct {
 	// asks for, and if it ever is it gets its own field rather than a nil that
 	// means one thing on this filter and another on the next.
 	ActiveOnly bool
+
+	// UIDSuffix narrows to the connection whose uid ends in these 12 lowercase
+	// hex characters — the "c=" tag shared.BuildUpstreamName stamps on the
+	// upstream application/program name, so a DBA staring at
+	// pg_stat_activity.application_name (or the MySQL/Oracle/MSSQL/Mongo
+	// equivalent) can paste it straight into this filter and land on the
+	// session. Matched with `right(uid::text, 12) = ?` (see
+	// idx_connections_uid_suffix), never a prefix or substring: the point of
+	// taking the *last* 12 hex characters of a UUIDv7 is that they are pure
+	// randomness, unlike the leading, time-ordered ones every connection
+	// opened in the same millisecond shares.
+	UIDSuffix string
 }
 
 // GrantProvenance says how the grant a session ran under came to exist. The
@@ -897,6 +932,34 @@ func (g *AccessGrant) MaxBytesTransferred() *int64 {
 	return g.Definition.MaxBytesTransferred
 }
 
+// StatementTimeout resolves the per-statement limit for this grant. global is
+// the instance-wide default (zero = none). Returns 0 when nothing applies.
+//
+// The definition's three states are resolved here and nowhere else:
+//
+//   - nil                     → global (which may itself be zero)
+//   - a pointer to 0          → 0, i.e. no limit, *overriding* global
+//   - a pointer to a positive → that many seconds
+//
+// A shapeless grant (no definition attached) falls back to global rather than
+// to the fail-closed zero the quota accessors use: the narrow answer here is
+// the *global* limit, since returning "no limit" would be the widening one and
+// returning something arbitrary would kill sessions the operator never
+// configured a limit for. GetActiveGrant refuses to hand out a definitionless
+// grant anyway — see Controls.
+func (g *AccessGrant) StatementTimeout(global time.Duration) time.Duration {
+	if g == nil || g.Definition == nil || g.Definition.StatementTimeoutSeconds == nil {
+		return global
+	}
+
+	secs := *g.Definition.StatementTimeoutSeconds
+	if secs <= 0 {
+		return 0
+	}
+
+	return time.Duration(secs) * time.Second
+}
+
 // ApprovalPatterns are the RE2 patterns that suspend a matching statement
 // until an approver resolves it, read from the grant's definition.
 func (g *AccessGrant) ApprovalPatterns() []string {
@@ -917,6 +980,21 @@ func (g *AccessGrant) ApproverUserGroupUIDs() []uuid.UUID {
 	}
 
 	return g.Definition.ApproverUserGroupUIDs
+}
+
+// DefinitionSlug is the slug of the definition this grant was issued from, or
+// "" when no definition is attached.
+//
+// Unlike the accessors above it carries no authorization weight at all — it is
+// a label, used to name the grant in the sqlcommenter tag dbbat can prepend to
+// forwarded statements — so a shapeless grant reports the empty string rather
+// than a fail-closed value.
+func (g *AccessGrant) DefinitionSlug() string {
+	if g == nil || g.Definition == nil {
+		return ""
+	}
+
+	return g.Definition.Slug
 }
 
 // newZeroQuota backs the fail-closed quota accessors: an exhausted quota,
@@ -989,6 +1067,18 @@ type GrantDefinition struct {
 	Controls            StringArray `bun:"controls,notnull,default:'{}'" json:"controls"`
 	MaxQueryCounts      *int64      `bun:"max_query_counts" json:"max_query_counts"`
 	MaxBytesTransferred *int64      `bun:"max_bytes_transferred" json:"max_bytes_transferred"`
+	// StatementTimeoutSeconds bounds how long a *single* statement issued
+	// under this definition may run. Three states, and the distinction
+	// between the last two is the point of the pointer:
+	//
+	//   nil — inherit the instance-wide default.
+	//   0   — explicitly no limit, overriding a global one. The escape hatch
+	//         for a dump or ETL definition, taken by an admin at edit time.
+	//   > 0 — the limit, in seconds.
+	//
+	// Read through AccessGrant.StatementTimeout, never directly: the
+	// inheritance is what makes the three states mean anything.
+	StatementTimeoutSeconds *int64 `bun:"statement_timeout_seconds" json:"statement_timeout_seconds"`
 	// Priority, when non-nil, is copied verbatim onto every grant
 	// materialized from this definition, pinning it above or below the tier
 	// its controls would otherwise earn. nil — the default — means "compute

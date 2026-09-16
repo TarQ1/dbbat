@@ -359,6 +359,15 @@ func runServer(ctx context.Context, flags *cliFlags) error {
 		MaxSize:    cfg.AuthCache.MaxSize,
 	})
 
+	// A malformed statement timeout disables the limit rather than shortening
+	// it (see Config.StatementTimeout), so it has to be said out loud: the
+	// operator asked for a bound and silently has none.
+	if cfg.StatementTimeoutMisconfigured() {
+		logger.WarnContext(ctx, "Invalid DBB_STATEMENT_TIMEOUT, no instance-wide statement limit is applied",
+			slog.String("value", cfg.StatementTimeout),
+			slog.String("hint", "use a Go duration such as 30s or 5m"))
+	}
+
 	proxies := startProxies(ctx, cfg, dataStore, proxyAuthCache, approvalDeps, rowWriter, dumpUploader, logger)
 
 	// One retention sweep for the whole process (nil when disabled, the default).
@@ -400,6 +409,49 @@ func startProxies(
 		mysql:    startMySQLProxy(ctx, cfg, dataStore, authCache, approvalDeps, rowWriter, logger),
 		mongo:    startMongoProxy(ctx, cfg, dataStore, authCache, approvalDeps, rowWriter, logger),
 		mssql:    startMSSQLProxy(ctx, cfg, dataStore, authCache, approvalDeps, rowWriter, logger),
+	}
+
+	// One resolver for the whole process: the store memoizes the parameter, so
+	// five resolvers would share one cache anyway, but building them here keeps
+	// the "who imposes the limit" wiring in one place.
+	statementTimeouts := shared.NewStatementTimeoutResolver(dataStore, cfg)
+
+	set.postgres.SetStatementTimeouts(statementTimeouts)
+
+	if set.oracle != nil {
+		set.oracle.SetStatementTimeouts(statementTimeouts)
+	}
+
+	if set.mysql != nil {
+		set.mysql.SetStatementTimeouts(statementTimeouts)
+	}
+
+	if set.mongo != nil {
+		set.mongo.SetStatementTimeouts(statementTimeouts)
+	}
+
+	if set.mssql != nil {
+		set.mssql.SetStatementTimeouts(statementTimeouts)
+	}
+
+	// The dbbat identity tag, on the three protocols that have somewhere to put
+	// it: a sqlcommenter-style comment on PostgreSQL and MySQL/MariaDB, the
+	// `comment` command field on MongoDB. Oracle is deliberately absent —
+	// V$SQL deduplicates on statement text, so a per-connection tag would
+	// defeat its shared-cursor cache — and so is SQL Server.
+	if cfg.QueryTagging.Enabled {
+		set.postgres.SetQueryTagging(true)
+
+		if set.mysql != nil {
+			set.mysql.SetQueryTagging(true)
+		}
+
+		if set.mongo != nil {
+			set.mongo.SetQueryTagging(true)
+		}
+
+		logger.InfoContext(ctx, "statement tagging enabled",
+			slog.String("protocols", "postgresql,mysql,mongodb"))
 	}
 
 	set.postgres.SetDumpUploader(dumpUploader)
@@ -598,9 +650,19 @@ func startOracleProxy(
 		return nil
 	}
 
+	// A typo here is a startup failure rather than a silent "off": the absence
+	// of a tag looks exactly like the feature being disabled, so an operator
+	// who asked for attribution and got none would have no way to tell.
+	tagging, err := cfg.QueryTagging.ResolveOracle()
+	if err != nil {
+		logger.ErrorContext(ctx, "Oracle statement tagging misconfigured", slog.Any("error", err))
+		os.Exit(1)
+	}
+
 	srv := oracle.NewServer(dataStore, cfg.EncryptionKey, authCache, cfg.QueryStorage, cfg.Dump, logger)
 	srv.SetApprovalDeps(approvalDeps)
 	srv.SetRowWriter(rowWriter)
+	srv.SetStatementTagging(tagging)
 
 	go func() {
 		if err := srv.Start(cfg.ListenOracle); err != nil {
@@ -1898,6 +1960,19 @@ func buildEventPlumbing(
 		logger.InfoContext(ctx, "approval holds enabled",
 			slog.Duration("slack_delay", cfg.Approval.SlackDelayDuration()),
 			slog.Bool("slack_sql", cfg.Approval.SlackSQL))
+	}
+
+	// Same Slack client again: a session dbbat ends on its own is a sibling
+	// signal to the approval-hold escalation above, not a separate feature.
+	// Wired only when both a notifier exists (Slack is configured at all) and
+	// the operator did not turn terminations off — a nil concrete *SlackNotifier
+	// stored in the interface field would defeat Store's own nil check, so this
+	// checks the concrete pointer before handing it over.
+	if notifier := apiServer.Notifier(); notifier != nil && cfg.SlackNotify.Terminations {
+		dataStore.SetTerminationNotifier(notifier)
+
+		logger.InfoContext(ctx, "termination notifications enabled",
+			slog.Bool("sql", cfg.SlackNotify.SQL))
 	}
 
 	return apiServer, approvals, shared.ApprovalDeps{

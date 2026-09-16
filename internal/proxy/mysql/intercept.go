@@ -3,6 +3,8 @@ package mysql
 import (
 	"fmt"
 	"log/slog"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,10 +95,27 @@ func (h *handler) namesSessionDatabase(dbName string) bool {
 }
 
 // HandleQuery handles COM_QUERY (text protocol).
+//
+// runIntercepted is handed the *client's* text — it is what every control
+// matches on and what the queries row and the audit chain record. Only the
+// closure, which runs after all of them have passed, sees the tagged text, so
+// the tag exists on the wire to the upstream and nowhere else. Inert unless
+// DBB_QUERY_TAGGING is on.
 func (h *handler) HandleQuery(query string) (*gomysql.Result, error) {
 	return h.runIntercepted(query, nil, func() (*gomysql.Result, error) {
-		return h.session.upstreamConn.Execute(query)
+		return h.session.upstreamConn.Execute(h.upstreamText(query))
 	})
+}
+
+// upstreamText is the one place a statement's text differs between what dbbat
+// enforces and records — the client's — and what the upstream parses.
+//
+// There are exactly two callers, HandleQuery and HandleStmtPrepare, and both
+// call it at the last possible moment: after every grant control, every bypass
+// scan and any approval hold have run on the client's text. Returns its
+// argument unchanged unless DBB_QUERY_TAGGING is on.
+func (h *handler) upstreamText(sql string) string {
+	return h.session.queryTag.Apply(sql)
 }
 
 // HandleFieldList implements COM_FIELD_LIST. Deprecated since MySQL 5.7 but
@@ -127,7 +146,14 @@ func (h *handler) HandleStmtPrepare(query string) (int, int, any, error) {
 		return 0, 0, nil, ErrSwitchDatabaseDenied
 	}
 
-	stmt, err := h.session.upstreamConn.Prepare(query)
+	// Tagged once, here, on the text the upstream actually parses. Every later
+	// COM_STMT_EXECUTE runs that same prepared statement, so it inherits the
+	// tag for free — which is just as well, since COM_STMT_EXECUTE is a binary
+	// payload with no statement text to tag.
+	//
+	// syntheticSQL above, and everything recordQuery writes, keep the client's
+	// text.
+	stmt, err := h.session.upstreamConn.Prepare(h.upstreamText(query))
 	if err != nil {
 		errStr := err.Error()
 		h.recordQuery(syntheticSQL, nil, start, &errStr)
@@ -238,6 +264,15 @@ func (h *handler) runIntercepted(
 		return nil, err
 	}
 
+	// Limit: the pinned per-statement timeout. Same place as the grant
+	// controls above so the two cannot drift, and same shape of refusal.
+	if err := h.checkStatementTimeoutBypass(sql); err != nil {
+		errStr := err.Error()
+		h.recordQuery(sql, params, time.Now(), &errStr)
+
+		return nil, err
+	}
+
 	// Only now, with the payload cleared by the same controls the outer statement
 	// went through, is the prepared name worth remembering.
 	h.rememberPreparedName(sql)
@@ -265,10 +300,26 @@ func (h *handler) runIntercepted(
 		return nil, herr
 	}
 
+	// The clock starts when the statement is actually handed upstream, which
+	// is *after* any approval hold resolved: time parked on a human is not the
+	// statement's to account for.
 	start := time.Now()
+
+	s.statementClock.StartAt(start)
+
 	result, err := exec()
+
+	s.statementClock.Stop()
+
 	if err != nil {
+		// A session dbbat tore down reports *why* rather than the socket error
+		// the teardown produced: "connection reset" on the statement that
+		// caused it is the least useful thing the queries page could say.
 		errStr := err.Error()
+		if t := s.recordedTermination(); t.Set() {
+			errStr = t.Message()
+		}
+
 		h.recordQuery(sql, params, start, &errStr)
 
 		return result, err
@@ -690,4 +741,63 @@ func upstreamStmt(ctx any) (interface {
 	})
 
 	return stmt, ok
+}
+
+// statementTimeoutSetPatterns detect a client trying to change the
+// per-statement limit dbbat pinned on the session, on either dialect.
+//
+// Every SET is refused rather than only the widening ones: parsing the value
+// would mean re-implementing two different unit grammars (milliseconds on
+// MySQL, fractional seconds on MariaDB, plus the DEFAULT keyword) to answer a
+// question that changes nothing — the watchdog enforces the ceiling either way,
+// and a client wanting a shorter limit can KILL its own query.
+var statementTimeoutSetPatterns = []*regexp.Regexp{
+	// SET [SESSION|GLOBAL|PERSIST|PERSIST_ONLY|@@...] max_execution_time = ...
+	regexp.MustCompile(`(?i)\bSET\s+(?:SESSION\s+|GLOBAL\s+|PERSIST\s+|PERSIST_ONLY\s+|LOCAL\s+)?` +
+		`(?:@@(?:session|global|local)\.)?max_execution_time\s*=`),
+	// The MariaDB spelling.
+	regexp.MustCompile(`(?i)\bSET\s+(?:SESSION\s+|GLOBAL\s+|PERSIST\s+|PERSIST_ONLY\s+|LOCAL\s+)?` +
+		`(?:@@(?:session|global|local)\.)?max_statement_time\s*=`),
+}
+
+// maxExecutionTimeHint matches MySQL's `/*+ MAX_EXECUTION_TIME(n) */` optimizer
+// hint, capturing n (milliseconds).
+//
+// The hint is checked rather than refused outright because a *smaller* value is
+// a client narrowing its own limit, which is exactly the behavior the limit is
+// trying to encourage. Only a value above the grant's limit is a bypass.
+var maxExecutionTimeHint = regexp.MustCompile(`(?i)/\*\+[^*]*\bMAX_EXECUTION_TIME\s*\(\s*(\d+)\s*\)`)
+
+// checkStatementTimeoutBypass refuses a statement that would unset or raise the
+// session's per-statement limit.
+//
+// A no-op when no limit is pinned: with nothing to bypass, `SET
+// max_execution_time` is an ordinary client setting and refusing it would break
+// sessions the feature does not even apply to.
+func (h *handler) checkStatementTimeoutBypass(sql string) error {
+	limit := h.session.statementLimit
+	if limit <= 0 {
+		return nil
+	}
+
+	// Comment-normalized like every other check on this path: MySQL ignores
+	// `/* … */` wherever whitespace is allowed, so `SET/**/max_execution_time=0`
+	// reaches the server as a plain SET.
+	if shared.MatchesAnyNormalizedSQL(sql, statementTimeoutSetPatterns) {
+		return fmt.Errorf("%w (limit %s)", ErrStatementTimeoutManaged, limit)
+	}
+
+	// The hint is deliberately matched on the *raw* SQL: normalization strips
+	// comments, and the hint lives inside one.
+	if m := maxExecutionTimeHint.FindStringSubmatch(sql); m != nil {
+		ms, err := strconv.ParseInt(m[1], 10, 64)
+
+		// An unparseable or zero value is the unbounded case (MySQL reads 0 as
+		// "no limit"), so it is refused like an over-limit one.
+		if err != nil || ms == 0 || time.Duration(ms)*time.Millisecond > limit {
+			return fmt.Errorf("%w (limit %s)", ErrStatementTimeoutManaged, limit)
+		}
+	}
+
+	return nil
 }

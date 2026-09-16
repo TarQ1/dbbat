@@ -49,6 +49,23 @@ type Server struct {
 	shutdown   chan struct{}
 	ctx        context.Context //nolint:containedctx
 	cancel     context.CancelFunc
+
+	// statementTimeouts resolves the instance-wide per-statement limit at
+	// every session's auth. nil — the default — means no limit is imposed
+	// beyond whatever the grant definition carries.
+	statementTimeouts *shared.StatementTimeoutResolver
+
+	// statementTagging is DBB_QUERY_TAGGING_ORACLE=user, already resolved.
+	// false — the default — forwards every client packet byte for byte, which
+	// is what this proxy did before the tag existed.
+	statementTagging bool
+}
+
+// SetStatementTagging turns the per-user statement tag on for new sessions.
+// Resolved from DBB_QUERY_TAGGING_ORACLE by the caller, so an invalid value
+// fails the process at startup rather than reaching a session.
+func (s *Server) SetStatementTagging(on bool) {
+	s.statementTagging = on
 }
 
 // NewServer creates a new Oracle proxy server.
@@ -203,7 +220,9 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 
 	session := newSession(clientConn, s.store, s.encryptionKey, s.logger, s.ctx, s.authCache, s.queryStorage, s.dumpConfig, s.rowWriter)
 	session.approvalDeps = s.approvalDeps
+	session.statementTimeouts = s.statementTimeouts
 	session.dumpUploader = s.dumpUploader
+	session.statementTaggingEnabled = s.statementTagging
 	if err := session.run(); err != nil {
 		// Two expected outcomes, told apart by the sentinel rather than by
 		// matching on the error text as this used to. The string match demoted
@@ -262,6 +281,13 @@ func (s *Server) runDumpCleanup() {
 			return
 		}
 	}
+}
+
+// SetStatementTimeouts installs the resolver for the instance-wide
+// per-statement limit. Called by the wiring in main; a server without one never
+// imposes a limit that the grant definition did not itself carry.
+func (s *Server) SetStatementTimeouts(r *shared.StatementTimeoutResolver) {
+	s.statementTimeouts = r
 }
 
 // SetApprovalDeps installs the approval-hold collaborators. A server without

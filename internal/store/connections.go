@@ -32,6 +32,17 @@ func WithGrantUID(grantUID uuid.UUID) ConnectionOption {
 	return func(c *Connection) { c.GrantUID = &grantUID }
 }
 
+// WithUID pins the connection row's uid to one generated ahead of time
+// (store.NewConnectionUID), instead of the UUIDv7 createConnection would
+// otherwise generate itself. Every protocol tags the upstream-facing
+// application/program name with the connection uid
+// (shared.BuildUpstreamName's "c=" field), and that tag has to be composed
+// before — sometimes long before — this insert runs, so the uid it carries
+// must be decided by the caller rather than read back afterward.
+func WithUID(uid uuid.UUID) ConnectionOption {
+	return func(c *Connection) { c.UID = uid }
+}
+
 // CreateConnection creates a new connection record, stamping connected_at
 // from time.Now().
 func (s *Store) CreateConnection(
@@ -117,7 +128,7 @@ func (s *Store) createConnection(
 // tail of a session could simply recopy it; sealing means correcting the stamp
 // after a deletion needs the chain key, exactly like forging a statement.
 func (s *Store) CloseConnection(ctx context.Context, uid uuid.UUID) error {
-	return s.closeConnection(ctx, uid, time.Now())
+	return s.closeConnection(ctx, uid, time.Now(), Termination{})
 }
 
 // CloseConnectionAt is CloseConnection with the close instant supplied by the
@@ -128,15 +139,31 @@ func (s *Store) CloseConnection(ctx context.Context, uid uuid.UUID) error {
 // seal-from-stored-statements routine CloseConnection uses — never a second
 // MAC implementation.
 func (s *Store) CloseConnectionAt(ctx context.Context, uid uuid.UUID, closedAt time.Time) error {
-	return s.closeConnection(ctx, uid, closedAt)
+	return s.closeConnection(ctx, uid, closedAt, Termination{})
 }
 
-func (s *Store) closeConnection(ctx context.Context, uid uuid.UUID, closedAt time.Time) error {
+// CloseConnectionWithReason is CloseConnection for a session *dbbat* ended: the
+// reason lands on the row in the same UPDATE as disconnected_at, so a
+// terminated session can never be read back as a clean one, and a
+// connection.terminated audit entry carrying the reason (and the statement that
+// caused it) is written alongside the ordinary close entry.
+//
+// A zero Termination makes this exactly CloseConnection, so a caller that only
+// sometimes has a reason does not need two code paths.
+func (s *Store) CloseConnectionWithReason(ctx context.Context, uid uuid.UUID, t Termination) error {
+	return s.closeConnection(ctx, uid, time.Now(), t)
+}
+
+func (s *Store) closeConnection(ctx context.Context, uid uuid.UUID, closedAt time.Time, t Termination) error {
 	q := s.db.NewUpdate().
 		Model((*Connection)(nil)).
 		Where("uid = ?", uid).
 		Where("disconnected_at IS NULL").
 		Set("disconnected_at = ?", closedAt)
+
+	if t.Set() {
+		q = q.Set("termination_reason = ?", t.Reason)
+	}
 
 	if s.ChainEnabled() {
 		seq, mac, err := s.queryChainHead(ctx, uid)
@@ -184,7 +211,13 @@ func (s *Store) closeConnection(ctx context.Context, uid uuid.UUID, closedAt tim
 		return ErrConnectionNotFound
 	}
 
+	// Reason first, seal second: that is the order the two facts happened in,
+	// and the order a reader walking the chain wants to meet them.
+	s.recordConnectionTerminated(ctx, &closed[0], t)
 	s.recordConnectionClosed(ctx, &closed[0], connectionClosedBySession)
+
+	// Best-effort and off this call's critical path — see notifyTermination.
+	s.notifyTermination(ctx, &closed[0], t)
 
 	return nil
 }
@@ -528,7 +561,15 @@ func (s *Store) orphanCloseQuery(db bun.IDB) *bun.UpdateQuery {
 		// last_activity_at, not now(): retention should measure from when the
 		// session actually stopped talking, and a crashed session must not get
 		// its clock reset by every subsequent restart.
-		Set("disconnected_at = last_activity_at")
+		Set("disconnected_at = last_activity_at").
+		// Why the row is closed, so termination_reason has no unexplained NULLs
+		// on closed rows: without it a crash-orphaned session reads exactly like
+		// a client that hung up politely, which is the one thing a reader of
+		// that column must not be left guessing about. COALESCE is defensive:
+		// nothing writes termination_reason while a row is still open today
+		// (it lands in the same UPDATE as disconnected_at), and if anything
+		// ever does, the more specific reason must survive this one.
+		Set("termination_reason = COALESCE(termination_reason, ?)", TerminationInstanceLost)
 }
 
 // orphanChainHead is one connection's recoverable chain head, as read back by
@@ -864,7 +905,8 @@ func (s *Store) GetConnectionByUID(ctx context.Context, uid uuid.UUID) (*Connect
 	err := s.db.NewSelect().
 		Model(conn).
 		ColumnExpr("uid, user_id, database_id, source_ip::text, connected_at, last_activity_at, "+
-			"disconnected_at, queries, bytes_transferred, instance_id, upstream_tls, dump_key, grant_uid, "+
+			"disconnected_at, queries, bytes_transferred, termination_reason, instance_id, upstream_tls, "+
+			"dump_key, grant_uid, terminate_requested_at, terminate_requested_by, terminate_reason, "+
 			"query_chain_mac, query_chain_len, query_chain_stamp_version").
 		Where("uid = ?", uid).
 		Scan(ctx)
@@ -900,7 +942,8 @@ func (s *Store) GetConnectionsByUIDs(ctx context.Context, uids []uuid.UUID) (map
 	err := s.db.NewSelect().
 		Model(&connections).
 		ColumnExpr("uid, user_id, database_id, source_ip::text, connected_at, last_activity_at, "+
-			"disconnected_at, queries, bytes_transferred, instance_id, upstream_tls, dump_key, grant_uid, "+
+			"disconnected_at, queries, bytes_transferred, termination_reason, instance_id, upstream_tls, "+
+			"dump_key, grant_uid, terminate_requested_at, terminate_requested_by, terminate_reason, "+
 			"query_chain_mac, query_chain_len, query_chain_stamp_version").
 		Where("uid IN (?)", bun.List(uids)).
 		Scan(ctx)
@@ -948,7 +991,8 @@ func (s *Store) buildListConnectionsQuery(
 	q := s.db.NewSelect().
 		Model(dest).
 		ColumnExpr("uid, user_id, database_id, source_ip::text, connected_at, last_activity_at, " +
-			"disconnected_at, queries, bytes_transferred, instance_id, upstream_tls, dump_key, grant_uid")
+			"disconnected_at, queries, bytes_transferred, termination_reason, instance_id, upstream_tls, " +
+			"dump_key, grant_uid, terminate_requested_at, terminate_requested_by, terminate_reason")
 
 	if filter.UserID != nil {
 		q = q.Where("user_id = ?", *filter.UserID)
@@ -977,6 +1021,10 @@ func (s *Store) buildListConnectionsQuery(
 
 	if filter.BeforeUID != nil {
 		q = q.Where("uid < ?", *filter.BeforeUID)
+	}
+
+	if filter.UIDSuffix != "" {
+		q = q.Where("right(uid::text, 12) = ?", filter.UIDSuffix)
 	}
 
 	q = q.Order("uid DESC")

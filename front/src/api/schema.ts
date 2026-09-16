@@ -1338,6 +1338,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/connections/{uid}/terminate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Connection UID */
+                uid: components["parameters"]["ConnectionUID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End a live proxied session
+         * @description Terminates one live session: dbbat cancels whatever statement is
+         *     running upstream, then drops both legs of the connection.
+         *
+         *     **`POST .../terminate`, not `DELETE /connections/{uid}`.** The session
+         *     is not the row. `DELETE` would read as deleting the ledger entry, which
+         *     retention owns and which the audit chain's
+         *     `connection.opened`/`connection.closed` pair exists to protect.
+         *
+         *     **Terminating is not revoking.** The grant is untouched, so the user can
+         *     reconnect immediately under it. Use `DELETE /grants/{uid}` to withdraw
+         *     the access itself — that ends *every* session of that user on that
+         *     database, this ends one.
+         *
+         *     **`202`, not `200`.** The replica serving this call is not necessarily
+         *     the one serving the session: `connections.run_id` says who is. The
+         *     request is written to the connection row, this replica signals its own
+         *     live sessions immediately, and the replica that owns the session acts on
+         *     it within about two seconds. `local` in the response says which of the
+         *     two happened.
+         *
+         *     The optional `reason` is recorded on the connection row and in the
+         *     `connection.terminated` audit entry. It is never shown to the client
+         *     whose session is ending.
+         *
+         *     **Requires admin role.**
+         */
+        post: operations["terminateConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/connections/{uid}/dump": {
         parameters: {
             query?: never;
@@ -2036,6 +2083,26 @@ export interface paths {
          * @description Atomically upserts all public.* parameters. Admin-only.
          */
         put: operations["updateInstancePublic"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/instance/limits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update instance-wide limits
+         * @description Writes the `limits.*` parameter group. Admin-only. An empty `statement_timeout` clears the parameter, falling back to DBB_STATEMENT_TIMEOUT; "0" disables the limit outright.
+         */
+        put: operations["updateInstanceLimits"];
         post?: never;
         delete?: never;
         options?: never;
@@ -2885,6 +2952,15 @@ export interface components {
             /** Format: int64 */
             max_bytes_transferred?: number | null;
             /**
+             * Format: int64
+             * @description Per-statement time limit for grants issued from this definition.
+             *     Three states: `null`/omitted inherits the instance-wide default
+             *     (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+             *     means explicitly no limit, overriding that default; a positive
+             *     value is the limit in seconds.
+             */
+            statement_timeout_seconds?: number | null;
+            /**
              * Format: int32
              * @description Selection priority stamped verbatim on every grant materialized
              *     from this definition. `null` — the normal case — means the grant
@@ -3007,6 +3083,15 @@ export interface components {
             /** Format: int64 */
             max_bytes_transferred?: number | null;
             /**
+             * Format: int64
+             * @description Per-statement time limit for grants issued from this definition.
+             *     Three states: `null`/omitted inherits the instance-wide default
+             *     (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+             *     means explicitly no limit, overriding that default; a positive
+             *     value is the limit in seconds.
+             */
+            statement_timeout_seconds?: number | null;
+            /**
              * Format: int32
              * @description Optional selection priority for grants materialized from this
              *     definition. Omit (or send `null`) to let each grant take the tier
@@ -3101,6 +3186,17 @@ export interface components {
             max_bytes_transferred?: number | null;
             /** @description When true, resets max_bytes_transferred to unlimited. */
             clear_max_bytes_transferred?: boolean;
+            /**
+             * Format: int64
+             * @description Per-statement time limit for grants issued from this definition.
+             *     Three states: `null`/omitted inherits the instance-wide default
+             *     (`limits.statement_timeout`, else `DBB_STATEMENT_TIMEOUT`); `0`
+             *     means explicitly no limit, overriding that default; a positive
+             *     value is the limit in seconds.
+             */
+            statement_timeout_seconds?: number | null;
+            /** @description When true, resets statement_timeout_seconds to null, i.e. back to inheriting the instance-wide default. Needed because `null` and `0` mean different things here, so sending `null` cannot express it. */
+            clear_statement_timeout_seconds?: boolean;
             /** Format: int32 */
             priority?: number | null;
             /** @description When true, resets priority to auto (tier derived from controls). */
@@ -3530,6 +3626,11 @@ export interface components {
              * @description Total bytes transferred
              */
             bytes_transferred: number;
+            /**
+             * @description Why *dbbat* ended this session, when dbbat is what ended it. Absent — the ordinary case — means the client or the network did. `admin_terminated` is `POST /connections/{uid}/terminate`; `instance_lost` means nobody ended it — the process serving it died and the crash reconcile closed the row on its behalf.
+             * @enum {string|null}
+             */
+            termination_reason?: "statement_timeout" | "grant_expired" | "quota_exceeded" | "grant_revoked" | "admin_terminated" | "instance_lost" | null;
             /** @description Whether the proxy→upstream leg of this session was actually encrypted. The server's ssl_mode states a policy, not an outcome: the opportunistic modes (`prefer`, and the empty default) offer TLS and fall back to plaintext when the target refuses, so only the session knows which way it went. Always false for Oracle, whose proxy relays the client's own TNS Connect descriptor over a plain socket. */
             upstream_tls?: boolean;
             /**
@@ -3537,6 +3638,18 @@ export interface components {
              * @description The access grant this session authenticated under — the auth-time selection, pinned for the life of the connection and never updated afterwards. Null on connections that predate this column, or whose grant has since been deleted (revocation does not clear it — only deletion, which does not otherwise happen, does).
              */
             grant_uid?: string | null;
+            /**
+             * Format: date-time
+             * @description When an admin asked for this session to end, through `POST /connections/{uid}/terminate`. It is an *intent*, not an outcome: the replica serving the API call is not necessarily the one serving the session, so this is written first and the owning replica acts on it within a couple of seconds. A session that closed on its own in between keeps this set with no `termination_reason`.
+             */
+            terminate_requested_at?: string | null;
+            /**
+             * Format: uuid
+             * @description The admin who asked. Null when nobody did.
+             */
+            terminate_requested_by?: string | null;
+            /** @description That admin's free text, never shown to the client whose session is ending. Distinct from `termination_reason`, which is the closed vocabulary describing what actually happened. */
+            terminate_reason?: string | null;
         };
         ConnectionDetail: components["schemas"]["Connection"] & {
             dump: components["schemas"]["DumpMetadata"];
@@ -3558,6 +3671,13 @@ export interface components {
              *     disabled, the default, it is always true.
              */
             statements_retained: boolean;
+            /** @description The admin named by `terminate_requested_by`, resolved to a username so the page can say "terminated by alice". Absent when nobody asked for this session to end, and when the account that did has since been deleted. */
+            terminated_by?: components["schemas"]["TerminationRequester"] | null;
+        };
+        TerminationRequester: {
+            /** Format: uuid */
+            uid: string;
+            username: string;
         };
         GrantSummary: {
             /**
@@ -4114,7 +4234,28 @@ export interface components {
             };
             /** @description Only present for admin callers */
             public?: components["schemas"]["PublicEndpoints"];
+            /** @description Only present for admin callers */
+            limits?: components["schemas"]["InstanceLimits"];
             resolved: components["schemas"]["ResolvedEndpoints"];
+            resolved_limits: components["schemas"]["ResolvedInstanceLimits"];
+        };
+        /** @description Raw operator-configured instance-wide limits (the `limits.*` parameter group), before the environment-variable fallback is applied. */
+        InstanceLimits: {
+            /** @description Go duration string ("30s", "5m") bounding how long a single statement may run. Empty means the parameter is unset and DBB_STATEMENT_TIMEOUT applies; "0" disables the limit outright. */
+            statement_timeout: string;
+        };
+        /** @description The instance-wide limits that actually apply. */
+        ResolvedInstanceLimits: {
+            /**
+             * Format: int64
+             * @description Effective per-statement limit in seconds; 0 = no limit.
+             */
+            statement_timeout_seconds: number;
+            /**
+             * @description Where the effective value came from: `parameter` when the store parameter is set (including to an explicit "0", which disables the limit), `env` when the environment variable supplies it, empty when neither is configured.
+             * @enum {string}
+             */
+            statement_timeout_source: "" | "parameter" | "env";
         };
         /** @description Standard error response */
         Error: {
@@ -4324,6 +4465,7 @@ export type DeviceConsentInfo = components['schemas']['DeviceConsentInfo'];
 export type DeviceConsentRequest = components['schemas']['DeviceConsentRequest'];
 export type Connection = components['schemas']['Connection'];
 export type ConnectionDetail = components['schemas']['ConnectionDetail'];
+export type TerminationRequester = components['schemas']['TerminationRequester'];
 export type GrantSummary = components['schemas']['GrantSummary'];
 export type DumpMetadata = components['schemas']['DumpMetadata'];
 export type Query = components['schemas']['Query'];
@@ -4345,6 +4487,8 @@ export type SetParameterRequest = components['schemas']['SetParameterRequest'];
 export type PublicEndpoints = components['schemas']['PublicEndpoints'];
 export type ResolvedEndpoints = components['schemas']['ResolvedEndpoints'];
 export type InstanceInfo = components['schemas']['InstanceInfo'];
+export type InstanceLimits = components['schemas']['InstanceLimits'];
+export type ResolvedInstanceLimits = components['schemas']['ResolvedInstanceLimits'];
 export type Error = components['schemas']['Error'];
 export type MessageResponse = components['schemas']['MessageResponse'];
 export type McpMessage = components['schemas']['MCPMessage'];
@@ -6439,6 +6583,26 @@ export interface operations {
                  *     400 rather than silently dropped.
                  */
                 active?: boolean;
+                /**
+                 * @description Filter by the last 12 hex characters of the connection uid — the
+                 *     "c=" tag every proxied upstream session now advertises in its
+                 *     application/program name (`dbbat/$version @$username
+                 *     c=<uid_suffix> for $clientAppName`, e.g. PostgreSQL's
+                 *     `application_name`, Oracle's `V$SESSION.PROGRAM`, MySQL's
+                 *     `program_name` connect attribute, `APP_NAME()` on SQL Server,
+                 *     `client.application.name` on MongoDB). Paste it from a
+                 *     `pg_stat_activity` row (or equivalent) to jump straight to the
+                 *     dbbat connection it came from.
+                 *
+                 *     Matched with `right(uid::text, 12)`, not a prefix: a UUIDv7's
+                 *     leading characters are a millisecond timestamp shared by every
+                 *     connection opened in the same instant, so only the trailing,
+                 *     purely-random 12 hex characters identify one connection. Case
+                 *     insensitive on input, normalized to lowercase. Must be exactly 12
+                 *     hex characters — anything else is refused with 400 rather than
+                 *     silently dropped.
+                 */
+                uid_suffix?: string;
                 /** @description Maximum number of results to return */
                 limit?: components["parameters"]["Limit"];
                 /** @description Number of results to skip for pagination */
@@ -6490,6 +6654,54 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    terminateConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Connection UID */
+                uid: components["parameters"]["ConnectionUID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    /** @description Why, for the audit log. Optional; an absent or empty body is a termination with no stated reason. */
+                    reason?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The session is live and the termination was requested */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        message: string;
+                        /** @description True when this replica was serving the session and signaled it directly, so it is already tearing down. False means the session belongs to another replica, which picks the request up on its next poll (about two seconds), or that it was already terminating from an earlier request. */
+                        local: boolean;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /** @description The connection is already closed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };
@@ -7283,6 +7495,32 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["PublicEndpoints"];
+            };
+        };
+        responses: {
+            /** @description Settings saved */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    updateInstanceLimits: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InstanceLimits"];
             };
         };
         responses: {

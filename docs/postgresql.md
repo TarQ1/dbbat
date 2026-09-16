@@ -63,6 +63,89 @@ DBBat sends `AuthenticationCleartextPassword` (`R`) to the client. Inside a TLS 
 
 Both DBBat user passwords (Argon2id) and DBBat API keys (prefix `dbb_`) are accepted as the password. API key verification is independent of the user password path.
 
+## Finding a session in pg_stat_activity
+
+Every proxied session's `application_name` is dbbat-branded and carries the
+connection's own uid, not just the dbbat user's:
+
+```sql
+SELECT pid, application_name, state, query
+FROM pg_stat_activity
+WHERE application_name LIKE 'dbbat/%';
+```
+
+`application_name` reads `dbbat/0.28.1 @florent c=3f9a1c7b2e4d for psql` — the
+`c=` tag is the last 12 hex characters of the connection uid. Paste it (or the
+whole `c=...` token) into the connections page's search box, or call
+`GET /api/v1/connections?uid_suffix=3f9a1c7b2e4d` directly, to land on the
+exact dbbat connection: its queries, its grant, and the Terminate button —
+rather than guessing from the username alone, which is ambiguous the moment a
+user has more than one session open.
+
+## Statement tagging (`DBB_QUERY_TAGGING`)
+
+`application_name` above answers "which dbbat session is this?" — but only in
+the views that *have* an `application_name` column. The three places a DBA
+actually looks when a database is slow do not:
+
+- **RDS Performance Insights** groups by SQL digest and shows the database
+  user and the client host. Every dbbat session logs in as the same shared
+  role from the same host (the proxy), so the whole fleet's load reads as one
+  client.
+- **`pg_stat_statements`** keys on `(userid, dbid, queryid)`. `application_name`
+  is not a dimension of it at all.
+- **The slow query log** (`log_min_duration_statement`) prints the statement
+  text and nothing else.
+
+What all three *do* show is the statement text. With `DBB_QUERY_TAGGING=true`,
+dbbat prepends a [sqlcommenter](https://google.github.io/sqlcommenter/)-style
+comment to every statement it forwards:
+
+```sql
+/*dbbat='0.28.1',user='florent',conn='3f9a1c7b2e4d',grant='diag-paris-habitat'*/ SELECT ...
+```
+
+`conn=` is the same 12 hex characters as `application_name`'s `c=` tag, so it
+feeds the same `GET /api/v1/connections?uid_suffix=` lookup.
+
+**Off by default.** It changes the bytes the database receives, so a
+deployment that pins statement text — a `pg_stat_statements` allowlist, a
+query firewall, a per-statement plan cache — turns it on knowingly.
+
+**Prepended, not appended.** sqlcommenter appends, but
+`pg_stat_activity.query` truncates at `track_activity_query_size` (1024 bytes
+by default) and so does the log. On exactly the long statements worth chasing,
+an appended tag is the part that gets cut.
+
+**Where it is applied.** The simple-query path tags `Query`; the extended one
+tags `Parse`, once, so every `Bind`/`Execute` of that prepared statement
+inherits it. `COPY ... FROM STDIN` is tagged like any other statement and the
+data stream after it is untouched.
+
+**What it does not change.** The tag exists on the wire to the upstream and
+nowhere else:
+
+- The `queries` table, the tamper-evident audit chain and the UI's query-text
+  search all hold the **client's** statement, untagged. The tag is a pure
+  function of `(version, user, connection, grant)` — all of which the
+  connection row already stores — so it is reconstructible without being
+  stored.
+- Every control runs on the client's text, before tagging: `read_only`,
+  `block_ddl`, `block_copy`, the read-only and statement-timeout bypass scans,
+  and approval-hold patterns. A pattern author never has to account for the
+  tag.
+- dbbat's own `.pcapng` captures tap the **client** leg only, so the tag does
+  not appear in them either.
+
+**Known limit: `pg_stat_statements` keeps the text of the *first* execution of
+a digest.** Two dbbat users running the same statement therefore share one row
+whose tag names whichever of them ran it first. The row's aggregate numbers
+stay correct; its tag is misleading. Performance Insights has the same
+property per digest. `pg_stat_activity`, the slow log and PI's per-sample text
+are exact. This is not fixed on purpose: the only way to make the digest
+per-user is to vary the tag per user, which stops repeated executions
+aggregating at all — a worse outcome than a misleading label.
+
 ## Testing
 
 ### Integration tests
@@ -83,3 +166,40 @@ PG_TEST_IMAGE=postgres:17 go test -tags integration -timeout 40m ./internal/prox
 | `DBBAT_STORE_TEST_IMAGE` | Image backing dbbat's own store (default `postgres:15-alpine`) |
 
 The suite dials **through** the proxy with `jackc/pgx/v5` and covers password / `dbb_` API-key / wrong-password auth, `sslmode=require` (proxy-terminated TLS) and `sslmode=disable`, upstream TLS (`ssl_mode` `require` / `disable` / `verify-full` against a TLS-enabled upstream container, asserted via `pg_stat_ssl`), refusal of an unknown database name, simple-protocol query + result-row capture, extended-protocol (Parse/Bind/Execute) bind-parameter capture, the `read_only`, `block_ddl` and `block_copy` grant controls, per-session `.pcapng` captures, and mid-session grant revocation tearing the connection down. Both default images have arm64 builds, so it runs unmodified on Apple Silicon (verified on 2026-07-21).
+
+## Per-statement time limits
+
+PostgreSQL is the one protocol where both layers are comfortable.
+
+**Layer 1**, the server-side setting: `SET SESSION statement_timeout = <ms>` is
+issued in `replayUpstreamStartup`, in the same batch as the read-only pin
+(`runUpstreamSetup`), before the client is told it is connected. A session that
+cannot be pinned fails rather than running unbounded. The client then gets a
+real `ERROR: canceling statement due to statement timeout` with SQLSTATE
+`57014`, and **the session survives** — which is the whole reason this layer
+exists.
+
+A statement that would unset or change it is refused through `validateStatement`
+(so the simple and extended paths cannot drift): `SET [SESSION|LOCAL]
+statement_timeout …`, `RESET statement_timeout`, and `RESET ALL`. Every `SET` is
+refused rather than only the widening ones — parsing PostgreSQL's unit grammar
+(`500`, `500ms`, `5s`, `1min`, `DEFAULT`) to allow a narrowing one would be a
+new place to be wrong about a security-relevant value, and a client wanting less
+time can cancel its own query. `SHOW statement_timeout` stays allowed. The
+matcher is comment-normalized, like every other check here:
+`SET/**/statement_timeout=0` reaches the server as a plain `SET`.
+
+**Layer 2**, the watchdog: `LimitGuard` trips `ErrStatementTimeout` once the
+oldest in-flight statement passes `limit + 2s`. Several statements can be in
+flight at once under the extended protocol, so the clock holds the *oldest*
+start (`extendedState.pendingQueries`) and is re-armed from the next pending one
+on completion. A `COPY` in progress is a statement.
+
+On a trip dbbat sends a **`CancelRequest`** carrying the upstream's
+`BackendKeyData` before closing anything. It goes on a *fresh* connection — the
+backend running the query is not reading its socket — dialed through the same
+`shared.DialUpstream` path the session used, so an SSH bastion or a Kubernetes
+port-forward is honoured. This is not optional politeness: a backend in a long
+sequential scan does not notice a dead client until it next tries to send, and
+`client_connection_check_interval` defaults to `0`, so without the cancel the
+scan runs to completion.

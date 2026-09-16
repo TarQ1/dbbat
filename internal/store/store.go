@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -25,8 +26,16 @@ type Store struct {
 	storageDSN  string                    // Parsed storage DSN for security validation
 	authCache   *cache.AuthCache          // Optional auth cache for API key verification
 	revocations *cache.RevocationRegistry // In-process fan-out of grant revocations to live proxy sessions
+	sessions    *cache.SessionRegistry    // In-process fan-out of per-session terminations, keyed by connection uid
 	instanceID  string                    // Identifies this process among the replicas sharing this store
 	runID       string                    // Identifies this *run*: minted here, never configurable
+
+	// terminationNotifier is fired, fire-and-forget, whenever dbbat ends a
+	// session for a reason worth a human's attention. Optional, mirroring
+	// shared.ApprovalEscalator: nil when Slack notifications are not
+	// configured or the operator turned terminations off. See
+	// termination_notify.go.
+	terminationNotifier TerminationNotifier
 
 	// chainKey is the HMAC key sealing the audit and query chains — an HKDF
 	// subkey of the master encryption key, never the master key itself and
@@ -47,6 +56,22 @@ type Store struct {
 	auditChain  chainState
 	queryChains *queryChains
 	rowChains   *queryChains
+
+	// limitsCache memoizes the limits.* parameter group for a few seconds.
+	// The per-statement timeout is read once per *connection* on five
+	// protocols; without this every login would be an extra round trip for a
+	// value operators change a handful of times a year. See
+	// ResolveStatementTimeoutCached.
+	limitsCache limitsCache
+}
+
+// limitsCache is the process-wide memo behind ResolveStatementTimeoutCached.
+// Process-wide rather than per-proxy so that an operator writing the parameter
+// through the API can drop *every* reader's copy at once (InvalidateLimits).
+type limitsCache struct {
+	mu     sync.Mutex
+	value  Limits
+	readAt time.Time
 }
 
 // Options configures Store creation.
@@ -110,6 +135,7 @@ func New(ctx context.Context, dsn string, opts ...Options) (*Store, error) {
 		db:          db,
 		storageDSN:  dsn,
 		revocations: cache.NewRevocationRegistry(),
+		sessions:    cache.NewSessionRegistry(),
 		instanceID:  options.InstanceID,
 		// Minted here rather than taken from Options: the run id must identify
 		// one live process, and anything an operator can set — including
@@ -241,6 +267,13 @@ func (s *Store) SetInstanceID(instanceID string) {
 	s.instanceID = instanceID
 }
 
+// SetTerminationNotifier installs the optional collaborator fired after dbbat
+// ends a session on its own. Nil (the zero value, never explicitly set) is a
+// silent no-op — see TerminationNotifier.
+func (s *Store) SetTerminationNotifier(notifier TerminationNotifier) {
+	s.terminationNotifier = notifier
+}
+
 // InstanceID returns the identifier this process stamps on connection rows.
 func (s *Store) InstanceID() string {
 	return s.instanceID
@@ -286,6 +319,21 @@ func (s *Store) Revocations() *cache.RevocationRegistry {
 	}
 
 	return s.revocations
+}
+
+// Sessions returns the process-wide live-session registry, keyed by connection
+// uid: live proxy sessions register with it, and both the terminate endpoint
+// (for a session this replica happens to own) and the cross-instance poller
+// signal it.
+//
+// Same nil-safety contract as Revocations: nil on a nil or zero-value store,
+// and the registry's own methods are nil-safe, so callers never nil-check.
+func (s *Store) Sessions() *cache.SessionRegistry {
+	if s == nil {
+		return nil
+	}
+
+	return s.sessions
 }
 
 // migrationAdvisoryLockKey is the PostgreSQL advisory-lock key that serializes
