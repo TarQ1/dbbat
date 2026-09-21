@@ -80,6 +80,17 @@ type session struct {
 	// PBKDF2 path.
 	upstreamCustomHash bool
 
+	// tnsLegacyLength records that this session negotiated a **pre-v315** TNS,
+	// where every packet after the Accept carries its length in the 2-byte field
+	// at [0:2] instead of the 4-byte one at [0:4]. Read off the Accept the
+	// pre-auth relay forwards (see acceptUsesLegacyLength) and honored by every
+	// packet dbbat frames itself, on both legs.
+	//
+	// It is one flag for both directions on purpose: the Connect and the Accept
+	// are relayed byte for byte, so the client and the upstream negotiated the
+	// same version with each other and dbbat sits inside that one agreement.
+	tnsLegacyLength bool
+
 	// clientWideEncoding records whether the client encodes TTC AUTH key/value
 	// lengths as fixed 4-byte little-endian integers (OCI / sqlplus) rather than
 	// the compressed form (thin clients). Detected from AUTH Phase 1 and used to
@@ -464,17 +475,31 @@ func (s *session) run() error {
 		return fmt.Errorf("%w: %w", ErrClientAuthFailed, err)
 	}
 
-	// Step 4b: For OCI (wide-encoding) clients, drive AUTH Phase 1 against the
+	// Step 4b: For OCI (wide-encoding) clients — and for pre-v315 ones — drive
+	// AUTH Phase 1 against the
 	// upstream BEFORE challenging the client. The upstream's challenge carries
 	// the end-of-call summary shaped for the exact TTC caps this client
 	// negotiated (the relay forwarded them verbatim); dbbat's client challenge
 	// reuses those bytes. A wrong-width summary (the old hard-coded capture)
 	// leaves unread bytes in the OCI client's TTC buffer, and the client aborts
 	// the AUTH call with a break/reset marker exchange — the "sqlplus stalls
-	// before AUTH Phase 2" failure. Thin clients keep the proven hand-built
-	// summaries and the original ordering. (The dialect itself was read off
-	// Phase 1 above, before step 4a could refuse anything.)
-	if s.clientWideEncoding {
+	// before AUTH Phase 2" failure. (The dialect itself was read off Phase 1
+	// above, before step 4a could refuse anything.)
+	//
+	// A pre-v315 client is here for the identical reason, arrived at from the
+	// other end: ojdbc6 11.2.0.4 parses a *shorter* fixed Summary than the
+	// hand-built 6949 capture (30 bytes of tail where dbbat writes 32, measured
+	// against 23ai Free — testdata/ojdbc6_legacy.pcapng packet #009), leaves the
+	// two surplus zeros in its TTC read buffer, and reads the first of them as
+	// the message code of the *next* call: `Protocol violation: [0]` thrown from
+	// T4CTTIfun.receive during doOAUTH, before AUTH Phase 2 is ever flushed.
+	// Borrowing the live upstream's summary is strictly better than adding a
+	// third hard-coded capture beside the two in buildAuthChallengeEndMarker —
+	// the upstream sized it for the caps this very client negotiated.
+	//
+	// Modern thin clients (go-ora, python-oracledb thin, JDBC thin) keep the
+	// proven hand-built summaries and the original ordering.
+	if s.clientWideEncoding || s.tnsLegacyLength {
 		if err := s.beginUpstreamAuth(); err != nil {
 			return fmt.Errorf("upstream auth failed: %w", err)
 		}
@@ -528,7 +553,7 @@ func (s *session) run() error {
 	// back reproduces what a direct client accepts. No-op for single-packet
 	// (thin-client) AUTH OKs.
 	if len(s.upstreamAuthOKResponse) > 0 {
-		authOK = reframeAuthOK(authOK, s.upstreamAuthOKFlags, s.upstreamAuthOKFragLens)
+		authOK = reframeAuthOK(authOK, s.upstreamAuthOKFlags, s.upstreamAuthOKFragLens, s.tnsLegacyLength)
 	}
 
 	if _, err := s.clientConn.Write(authOK); err != nil {
@@ -625,6 +650,30 @@ func (s *session) startDumpIfConfigured(upstreamAddr string) {
 
 	s.dump = dw
 	s.clientConn = dump.NewWriteTapConn(s.clientConn, dw, dump.DirServerToClient)
+}
+
+// encodeSessionDataPacket wraps a TTC payload in a TNS Data packet framed the
+// way *this* session's peers framed theirs: the legacy 2-byte length on a
+// pre-v315 session, the v315+ 4-byte one otherwise.
+//
+// Every packet dbbat builds rather than relays goes through here. Writing the
+// v315+ form unconditionally is what made ojdbc6 11.2.0.4 — which negotiates
+// TNS version 310 — fail its login with `Invalid Packet Lenght`: the driver
+// reads the length out of [0:2], the 4-byte form leaves those two bytes zero,
+// and a zero-length packet is rejected before a single TTC byte is looked at.
+func (s *session) encodeSessionDataPacket(payload []byte) []byte {
+	return encodeDataPacketForSession(payload, s.tnsLegacyLength)
+}
+
+// encodeDataPacketForSession is encodeSessionDataPacket without a session, for
+// the two builders that are handed the flag instead of holding one.
+func encodeDataPacketForSession(payload []byte, legacyLength bool) []byte {
+	if legacyLength {
+		// The legacy form is exactly what encodeTNSPacket has always written.
+		return encodeTNSPacket(TNSPacketTypeData, payload)
+	}
+
+	return encodeV315DataPacket(payload)
 }
 
 // encodeV315DataPacket wraps a TTC payload in a v315+ TNS Data packet.
@@ -1017,7 +1066,7 @@ func (s *session) readPhase2Packet() (*TNSPacket, error) {
 		}
 
 		if isResetMarker(phase2Pkt) && sawBreak {
-			if _, err := s.clientConn.Write(buildResetMarker()); err != nil {
+			if _, err := s.clientConn.Write(buildResetMarker(s.tnsLegacyLength)); err != nil {
 				return nil, fmt.Errorf("failed to send reset marker: %w", err)
 			}
 
@@ -1221,7 +1270,7 @@ func (s *session) authenticateClient(phase1Pkt *TNSPacket) error {
 	primary := verifiers[0]
 
 	o5 := NewO5LogonServer(primary.O5LogonSalt, primary.decryptedVerifier)
-	if s.upstreamCustomHash && len(primary.decryptedVerifier18453) > 0 {
+	if s.clientSupportsVerifier18453() && len(primary.decryptedVerifier18453) > 0 {
 		o5.UseVerifier18453(primary.salt18453, primary.decryptedVerifier18453)
 	}
 
@@ -1256,9 +1305,10 @@ func (s *session) authenticateClient(phase1Pkt *TNSPacket) error {
 	s.logger.DebugContext(s.ctx, "AUTH challenge payload",
 		slog.Int("len", len(challengePayload)),
 		slog.String("hex_head", fmt.Sprintf("%x", challengePayload[:min(len(challengePayload), 60)])))
-	// Write as raw v315+ TNS Data packet (4-byte length header, not 2-byte)
-	// After Accept, all packets must use v315+ format.
-	challengeRaw := encodeV315DataPacket(challengePayload)
+	// Framed the way this session's Accept said to: the v315+ 4-byte length for
+	// a modern client, the legacy 2-byte one for a pre-v315 client such as
+	// ojdbc6 — which is the packet it was failing to read at OSESSKEY.
+	challengeRaw := s.encodeSessionDataPacket(challengePayload)
 	if _, err := s.clientConn.Write(challengeRaw); err != nil {
 		return fmt.Errorf("failed to send AUTH challenge: %w", err)
 	}
@@ -1311,6 +1361,30 @@ func (s *session) authenticateClient(phase1Pkt *TNSPacket) error {
 	return nil
 }
 
+// clientSupportsVerifier18453 reports whether this client can answer the modern
+// PBKDF2/HMAC-SHA512 O5LOGON challenge rather than the legacy 6949 one.
+//
+// The server's own capability (`upstreamCustomHash`, caps[4]&0x20 off the Set
+// Protocol reply) is necessary and was, until a pre-v315 client was actually
+// driven through the proxy, treated as sufficient. It is not: 23ai advertises
+// customHash to everyone, so an ojdbc6 11.2.0.4 session was answered with an
+// 18453 challenge it has no code to answer — it read the dictionary, found a
+// verifier type from a database release four years its junior, and closed the
+// socket with an EOF-flagged 10-byte packet instead of sending AUTH Phase 2
+// ("Protocol violation: [0]" out of `T4CTTIoauthenticate.doOAUTH`).
+//
+// The client half of the condition is the TNS version, and the two boundaries
+// are the same boundary rather than two that happen to line up: password
+// version 12C (verifier type 18453) and the extended 4-byte packet length both
+// arrive with Oracle 12.1, which is TNS 315. So a session negotiating below 315
+// is by construction a pre-12c client, and gets the challenge a real server
+// gives it — which is what 23ai Free itself sends this driver when it is dialed
+// directly (`testdata/ojdbc6_legacy.pcapng` packet #009: AUTH_VFR_DATA flagged
+// 0x1b25 = 6949, from the same server, on the same day).
+func (s *session) clientSupportsVerifier18453() bool {
+	return s.upstreamCustomHash && !s.tnsLegacyLength
+}
+
 // clientChallengeTrailer returns the end-of-call summary appended to the AUTH
 // challenge dbbat sends the client.
 //
@@ -1323,12 +1397,13 @@ func (s *session) authenticateClient(phase1Pkt *TNSPacket) error {
 // AUTH call with a break/reset marker exchange, stalling before AUTH Phase 2
 // (historically mis-attributed to the TCP-urgent OOB probe; see docs/oracle.md).
 //
-// For wide-encoding (OCI) clients the session therefore runs upstream AUTH
-// Phase 1 first (beginUpstreamAuth) and reuses the live upstream challenge's
-// summary bytes, which the real server sized for these exact caps. Thin clients
-// keep the proven hand-built summaries.
+// For wide-encoding (OCI) clients — and for pre-v315 ones, whose fixed Summary
+// is two bytes shorter than the hand-built 6949 capture — the session therefore
+// runs upstream AUTH Phase 1 first (beginUpstreamAuth) and reuses the live
+// upstream challenge's summary bytes, which the real server sized for these
+// exact caps. Modern thin clients keep the proven hand-built summaries.
 func (s *session) clientChallengeTrailer(verifierType int) []byte {
-	if s.clientWideEncoding && s.upstreamAuthResp != nil {
+	if (s.clientWideEncoding || s.tnsLegacyLength) && s.upstreamAuthResp != nil {
 		if t := s.upstreamAuthResp.challengeTrailer; len(t) > 0 && t[0] == byte(TTCFuncOERR) {
 			return t
 		}
@@ -2041,7 +2116,7 @@ func (s *session) breakUpstreamStatement() {
 		return
 	}
 
-	if _, err := s.upstreamConn.Write(buildBreakMarker()); err != nil {
+	if _, err := s.upstreamConn.Write(buildBreakMarker(s.tnsLegacyLength)); err != nil {
 		s.logger.DebugContext(s.ctx, "failed to send the upstream break marker",
 			slog.Any("error", err))
 
@@ -2052,7 +2127,7 @@ func (s *session) breakUpstreamStatement() {
 	// follows with a reset to resynchronize the stream. Sent immediately rather
 	// than after reading the server's acknowledgement, because the relay
 	// goroutine owns the upstream reader and this session is going away.
-	if _, err := s.upstreamConn.Write(buildResetMarker()); err != nil {
+	if _, err := s.upstreamConn.Write(buildResetMarker(s.tnsLegacyLength)); err != nil {
 		s.logger.DebugContext(s.ctx, "failed to send the upstream reset marker",
 			slog.Any("error", err))
 
@@ -2312,9 +2387,10 @@ func (s *session) interceptClientMessage(pkt *TNSPacket) (blocked bool) {
 		// third re-execution reading here — "a fetch arriving with no query in
 		// flight is a re-execution" — but it was written against a layout no
 		// Oracle client sends (see the note on TTCFuncOFETCH in ttc.go), so it
-		// only ever fired on misparsed piggybacks. It is gone; the two real
-		// re-execution frames (the SQL-less OALL8 and the 03/0x4e|0x04
-		// piggyback) are unaffected.
+		// only ever fired on misparsed piggybacks. It is gone; the real
+		// re-execution frames (the SQL-less OALL8, the 03/0x4e|0x04 piggyback,
+		// and the 03 5e that declares no statement, in either encoding) are
+		// unaffected.
 		//
 		// Its companion guarantee outlives it and needs no guard: "a fetch that
 		// merely continues a result set already streaming is never re-gated,
@@ -2440,7 +2516,7 @@ func (s *session) refusalWouldStrandFragments() bool {
 // recorded as blocked first, so the refusal is in the audit trail exactly like
 // every other one.
 func (s *session) gateUnnameableFrame(ttcPayload []byte) bool {
-	statements := stapledStatements(ttcPayload)
+	statements := stapledStatements(ttcPayload, s.clientWide64Encoding)
 
 	if len(statements) == 0 {
 		s.logger.DebugContext(s.ctx, logMsgUnnamedCallForwarded,
@@ -2580,14 +2656,14 @@ func (s *session) endSessionOnRefusal(ttcPayload []byte, sql string, refusal err
 // 03 5e <exec>` is the recorded shape, and a frame that staples two executes
 // runs both. Duplicates are dropped because the two anchors of that shape name
 // the same execute.
-func stapledStatements(ttcPayload []byte) []string {
+func stapledStatements(ttcPayload []byte, wide64 bool) []string {
 	var (
 		out  []string
 		seen = map[string]struct{}{}
 	)
 
 	for _, at := range statementOpOffsets(ttcPayload) {
-		result, err := decodeExecSQL(ttcPayload[at:])
+		result, err := decodeExecSQL(ttcPayload[at:], wide64)
 		if err != nil || result == nil || result.SQL == "" {
 			continue
 		}
@@ -3011,7 +3087,14 @@ func (s *session) interceptUpstreamMessage(pkt *TNSPacket) {
 	// Before anything is completed: the response to an execute is where the
 	// server names the cursor it allotted, and that mapping is what lets a
 	// later re-execution be gated against the right statement.
-	s.learnCursorID(ttcPayload)
+	s.learnCursorID(funcCode, ttcPayload)
+
+	// And the one cursor id that never rides an OER: a `SYS_REFCURSOR` the
+	// server opened inside a procedure body and reported in the call's bind
+	// output. Without it, every fetch the client drives on that cursor names an
+	// id the tracker does not hold — ORA-01031 under a restrictive grant, for
+	// ordinary read-only application code. See learnRefCursorIDs.
+	s.learnRefCursorIDs(ttcPayload)
 
 	switch funcCode { //nolint:exhaustive // only handling response-related codes
 	case TTCFuncQueryResult:
@@ -3134,6 +3217,11 @@ func (s *session) nextOERFrame() (oerShape, int, byte) {
 		shape.endOfResponse = s.clientWideEncoding
 		shape.fixedWidth64 = s.clientWide64Encoding
 	}
+
+	// Outside the learned/unlearned split on purpose: this is the TNS envelope,
+	// negotiated at the Accept, not a property of the summary object an upstream
+	// OER could teach.
+	shape.legacyLength = s.tnsLegacyLength
 
 	return shape, s.oerSeq, s.oerCallNumber
 }
@@ -3258,21 +3346,56 @@ func (s *session) handleOERStatus(ttcPayload []byte) {
 }
 
 // statusOERMayEndTheCall gates decodeOERAt's bit-less half — the fixed-width
-// status object an OCI client's calls end with — on the session not being in the
-// middle of a row stream.
+// status object an OCI client's calls end with — on what that status *reports*,
+// once the session is in the middle of a row stream.
 //
 // An OER that carries the end-of-call bit is unaffected: the bit is the protocol
-// saying the call is over, and that reading is what it always was.
+// saying the call is over, and that reading is what it always was. Outside a row
+// stream nothing is gated either: the payload cannot be row bytes there.
 //
-// The bit-less half needs the bound because an OCI fetch response demonstrably
-// carries a summary object of exactly this shape *inside* the row stream — one
-// per fetch round trip, at a constant offset, naming the streaming cursor and
-// reporting the running row count — so naming the cursor proves nothing here and
-// only a packet boundary separates such an object from byte 0. Refusing costs
-// nothing measurable: across testdata/, of the 641 server packets that arrive
-// mid-row-stream only 4 lead with 0x04, and all four are the genuine mid-fetch
-// ORA-01722 failures that decodeErrorOER completes below. See
-// decodeFixedStatusOERAt for both figures.
+// Inside one, the bound used to be a flat refusal, and it was drawn when no OCI
+// session ever *had* a row stream open: an OCI session's columns came from the
+// heuristic scanner, so rowStreamActive() never fired on one and the refusal
+// measured an empty set. Reading the describe records put those sessions in a
+// row stream, and the refusal then swallowed the very object it exists to read —
+// every OCI SELECT ends on a bare fixed-width status reporting ORA-01403, at
+// byte 0 of its own packet, *while rows are still considered to be streaming*.
+// Refusing it leaves the statement pending until the next one's
+// flushPendingQuery closes it, which is the whole symptom
+// TestDumpReplay_OCIStatusOERsCompleteTheirOwnStatement pins.
+//
+// What separates the terminator from the object the stream is full of is
+// measured on the corpus, not argued (TestDumpReplay_MidStreamOERFalsePositiveRate
+// prints both halves):
+//
+//   - An OCI fetch response carries a genuine summary object of this shape inside
+//     every continuation packet, naming the streaming cursor and reporting the
+//     fetch's running row count. All 149 of them in testdata/ report **success**
+//     (ErrorCode 0, counts 101, 201, … 14901). Not one reports end-of-data.
+//   - Of the 11 mid-row-stream packets that *lead* with 0x04, 4 are the genuine
+//     ORA-01722 mid-fetch failures decodeErrorOER completes below, and the other
+//     7 are the OCI end-of-fetch terminators — every one ORA-01403, CallStatus
+//     0x1.
+//
+// So the discriminator is the one the protocol already means: "no data found" is
+// a fetch saying it is over, and a fetch that is continuing cannot report it. A
+// bit-less **success** status stays refused mid-stream — that is exactly the
+// shape the 149 continuation objects have, and only a packet boundary separates
+// one of them from byte 0.
+//
+// It is deliberately *only* the code, and not also the cursor anchor a mid-fetch
+// **diagnostic** has to clear (midFetchOERNamesTheStreamingCursor). That anchor
+// was tried here and removed on live evidence: against a real 23ai server a
+// sqlplus fetch whose terminator correctly named cursor 2 was refused, because
+// the id dbbat held for that fetch was **17744** — a value `learnCursorID`'s
+// anchored scan had picked up out of row-stream bytes, which is the caveat that
+// function's own doc already spells out. The reference is not independent
+// evidence there, so requiring agreement with it does not add proof; it only
+// adds a way for one mislearned id to leave a statement pending. The error code
+// is evidence carried by the packet itself, on top of decodeOERFixedFieldsAt's
+// RetCode anchor (the code repeated 66 bytes later) and the cursor *bounds* —
+// and across 649 mid-row-stream packets, at every 0x04 offset, no row bytes
+// anywhere in the corpus satisfy it.
 //
 // Callers hold trackerMu.
 func (s *session) statusOERMayEndTheCall(info *oerInfo) bool {
@@ -3280,7 +3403,11 @@ func (s *session) statusOERMayEndTheCall(info *oerInfo) bool {
 		return true
 	}
 
-	s.logger.DebugContext(s.ctx, "bit-less status OER arrived mid-row-stream; leaving the call open",
+	if info.ErrorCode == oraNoDataFound {
+		return true
+	}
+
+	s.logger.DebugContext(s.ctx, logMsgMidStreamStatusRefused,
 		slog.Int("oer_call_status", info.CallStatus),
 		slog.Int("oer_cursor_id", info.CursorID),
 		slog.Int("ora_code", info.ErrorCode))
@@ -3315,24 +3442,51 @@ func (s *session) statusOERMayEndTheCall(info *oerInfo) bool {
 // fabricated one. The debug line is there because that is otherwise invisible —
 // if an unmeasured client ever reports a different cursor, this is what says so.
 //
-// One honest caveat about the reference value. `learnCursorID` runs on every
-// upstream packet and latches only once it has succeeded, so for a statement
-// whose id is never learned the anchored scan behind it keeps running over
-// row-stream bytes for the whole fetch — meaning the id this compares against
-// could itself have originated in row data. That is pre-existing (cursor-id
-// learning has always worked this way, and re-execution gating already trusts
-// it), but this anchor is what makes it load-bearing for query error text too.
+// The reference value used to carry an honest caveat, and the caveat has since
+// been measured: `learnCursorID` latched the first id its anchored scan found
+// and never revisited it, and live against a real 23ai server that first id was
+// **17744**, taken off a fetch's own describe records, on a fetch whose
+// terminator said 2. Comparing against a reference that came out of a scan over
+// payload bytes proves nothing; it only adds a way for one mislearned id to drop
+// a genuine ORA text.
+//
+// So the reference is used only when it is *not* itself a mid-stream scan hit —
+// cursorIDFromScan or better, which is where most of the corpus's learned ids
+// sit, the four mid-fetch failure fixtures included. A mid-stream hit is treated
+// exactly like an unlearned one: the diagnostic is dropped, which is the same
+// fail-closed direction this anchor already had.
+//
+// The describe-scan rank added in 2026-09-21-06 sits *below* cursorIDFromScan,
+// and the reference is still trusted at it — measured, not assumed: the
+// streaming cursor of every mid-fetch failure fixture is learned off the
+// QueryResult's own bundled summary (offsets 262/1230 across the four
+// recordings, per TestDumpReplay_CursorIDLearningSource), and refusing that
+// rank here drops the genuine ORA-01722 and records the failure as a success
+// (TestDumpReplay_OCIFailuresAreRecordedWithTheirORAText pins it). The rank is
+// about *learning corrections*, not about this anchor; the 17744 caveat it
+// carries — a describe scan can yield junk before the summary is reached — is
+// answered by the ranking itself, since the fetch's terminator outranks and
+// corrects it, and by statusOERMayEndTheCall, which dropped the reference
+// comparison outright for exactly this reason.
+//
+// Note statusOERMayEndTheCall dropped the comparison outright for the same
+// measurement; it is kept here because a *diagnostic* — unlike a status — is
+// something a result set's own rows could spell out, and the cursor anchor is
+// what that case has no answer for.
 //
 // Callers hold trackerMu.
 func (s *session) midFetchOERNamesTheStreamingCursor(info *oerInfo) bool {
-	streaming := s.tracker.pendingQuery.cursor.cursorID
-	if streaming != 0 && info.CursorID == int(streaming) {
+	cursor := s.tracker.pendingQuery.cursor
+
+	streaming := cursor.cursorID
+	if streaming != 0 && cursor.cursorIDSource != cursorIDFromMidStreamScan && info.CursorID == int(streaming) {
 		return true
 	}
 
 	s.logger.DebugContext(s.ctx, "mid-fetch OER does not name the streaming cursor; leaving the call open",
 		slog.Int("oer_cursor_id", info.CursorID),
 		slog.Int("streaming_cursor_id", int(streaming)),
+		slog.String("streaming_cursor_id_source", cursor.cursorIDSource.String()),
 		slog.Int("ora_code", info.ErrorCode))
 
 	return false
@@ -3445,7 +3599,7 @@ func (s *session) handleResponse(ttcPayload []byte) {
 	// The bit stays the whole discriminator here, and that is measured, not
 	// inherited: an OCI fetch response carries a genuine fixed-width summary
 	// object inside every continuation packet, so a bit-less scan accepts 149 of
-	// the corpus's 641 mid-row-stream packets — each one ending the call
+	// the corpus's 649 mid-row-stream packets — each one ending the call
 	// mid-fetch. See findOERInResponse and decodeFixedStatusOERAt.
 	if s.rowStreamActive() {
 		if oer := findOERInResponse(shape, ttcPayload); oer != nil {

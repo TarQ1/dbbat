@@ -154,11 +154,24 @@ The boundaries, all deliberate:
   recycles cursor ids, the re-executions after that resolved to a *stale*
   statement rather than failing visibly, so the gate ran the wrong SQL and
   `/queries` recorded the wrong SQL. With that fixed, two real thin clients
-  (`go-ora` v3 and `python-oracledb` thin) drove 124 re-executions through the
-  proxy — prepared loops, bind-heavy statements, interleaved cursors, DML,
-  PL/SQL, a REF cursor, a churned statement cache — and not one named a cursor
-  dbbat could not resolve. Numbers and method in `docs/oracle.md`, "Cursor-id
-  learning".
+  (`go-ora` v3 and `python-oracledb` thin) drove 128 re-executions of cursors
+  they had parsed through the proxy — prepared loops, bind-heavy statements,
+  interleaved cursors, DML, PL/SQL, a churned statement cache — and not one
+  named a cursor dbbat could not resolve. Numbers and method in
+  `docs/oracle.md`, "Cursor-id learning".
+
+  One shape used to be **outside** that claim and refused here as a result: a
+  `SYS_REFCURSOR`. The server opens it inside the procedure body, so no parse
+  ever crosses the proxy and the id arrives in the call's bind output rather
+  than in an OER — so under a grant carrying `read_only`, `block_ddl` or
+  approval patterns, driving a REF cursor got `ORA-01031`. That was this
+  bullet's rule working as written on the one known case where it refused
+  ordinary read-only work. dbbat now decodes the bind output and gates the
+  drives against the **call** — the statement this grant already gated once —
+  so they resolve like any other re-execution. See `docs/oracle.md`, "Learning a
+  REF cursor's id". A **thick/OCI** client (sqlplus, Instant Client) marshals
+  that bind output in the fixed-width encoding, and that is read too — the walk
+  asks the session which encoding it speaks rather than guessing from the bytes.
 
   Note what that measurement did **not** close: the stale-entry half is still
   open, and it is listed above as a live gap. The refusal here only covers the

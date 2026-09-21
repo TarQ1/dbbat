@@ -18,7 +18,7 @@ func TestDecodeExecSQL_SQLclLowercase(t *testing.T) {
 
 	ttc := mustHex(t, "116910000101010101035e11000280210001012a01010d000004ffffffff0132047fffffff00000000000000000000000100000000000000000000000000000073656c656374202773716c636c2d6f6b27206173206d2c20372a3620617320612066726f6d206475616c0101000000000000010100028000000000")
 
-	res, err := decodeExecSQL(ttc)
+	res, err := decodeExecSQL(ttc, false)
 	if err != nil {
 		t.Fatalf("decodeExecSQL failed: %v", err)
 	}
@@ -42,7 +42,7 @@ const modernSQLclDescribeFixture = "10173d20afa10f9cb3a32fc3f5f88e89224b787e0614
 func TestDecodeQueryResultV2_ModernDescribeNoPanic(t *testing.T) {
 	t.Parallel()
 
-	_ = decodeQueryResultV2(mustHex(t, modernSQLclDescribeFixture))
+	_ = decodeQueryResultV2(mustHex(t, modernSQLclDescribeFixture), false)
 }
 
 // TestDecodeQueryResultV2_ModernDescribeColumns verifies the modern-layout
@@ -52,7 +52,7 @@ func TestDecodeQueryResultV2_ModernDescribeNoPanic(t *testing.T) {
 func TestDecodeQueryResultV2_ModernDescribeColumns(t *testing.T) {
 	t.Parallel()
 
-	res := decodeQueryResultV2(mustHex(t, modernSQLclDescribeFixture))
+	res := decodeQueryResultV2(mustHex(t, modernSQLclDescribeFixture), false)
 	if res == nil {
 		t.Fatal("decodeQueryResultV2 returned nil")
 	}
@@ -93,7 +93,7 @@ const modernSQLclRowFixture = "10172a3e2cd14bedc60281caf2ab09f03cc0787e061417061
 func TestDecodeQueryResultV2_ModernDescribeRows(t *testing.T) {
 	t.Parallel()
 
-	res := decodeQueryResultV2(mustHex(t, modernSQLclRowFixture))
+	res := decodeQueryResultV2(mustHex(t, modernSQLclRowFixture), false)
 	if res == nil {
 		t.Fatal("decodeQueryResultV2 returned nil")
 	}

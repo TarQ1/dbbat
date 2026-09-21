@@ -26,14 +26,31 @@ import (
 // — each one is a chance to learn a cursor id, which is what the measurement
 // counts it for.
 const (
-	logMsgQueryIntercepted         = "query intercepted"
-	logMsgLearnedCursorID          = "learned server-assigned cursor id"
+	logMsgQueryIntercepted = "query intercepted"
+	logMsgLearnedCursorID  = "learned server-assigned cursor id"
+
+	// logMsgLearnedRefCursorID is deliberately its own record rather than a
+	// field on logMsgLearnedCursorID: this id came out of a call's bind output
+	// rather than off an OER, and it stands for the *call* rather than for the
+	// statement the cursor actually runs. Counting the two together would make
+	// the cursor-id learning measurement unable to tell them apart, which is the
+	// distinction TestIntegration_CursorIDLearningMissRate exists to keep.
+	logMsgLearnedRefCursorID = "learned a REF cursor id from a call's bind output"
+
 	logMsgReexecGated              = "intercepted cursor re-execution"
 	logMsgUntrackedCursorForwarded = "forwarding a re-execution of an untracked cursor: " +
 		"the grant carries no statement-shaped control"
 	logMsgUntrackedCursorRefused = "refused a re-execution of an untracked cursor under a restrictive grant"
 	logMsgCursorsClosed          = "client closed cursors"
 	logMsgRecycledCursorID       = "cursor id recycled onto a different statement"
+
+	// logMsgMidStreamStatusRefused is what statusOERMayEndTheCall writes when a
+	// bit-less fixed-width status arrives mid-row-stream and is not the
+	// end-of-data that ends a fetch. On an OCI session it is the difference
+	// between a statement completed by its own OER and one left pending for the
+	// next statement's flushPendingQuery, so a live suite can count it: see
+	// TestIntegration_OCIRowCaptureCarriesRealColumnNames.
+	logMsgMidStreamStatusRefused = "bit-less status OER arrived mid-row-stream; leaving the call open"
 
 	// logMsgUnnamedCallForwarded is the fail-open record: a client message
 	// whose call dbbat could not name is forwarded with no reading taken off
@@ -156,6 +173,25 @@ type trackedCursor struct {
 	bindValues []string
 	parsedAt   time.Time
 	columns    []columnDef // Column definitions from first response (for multi-fetch)
+
+	// fromRefCursorBind marks an entry learned from a call's bind output rather
+	// than from a parse dbbat saw — a `SYS_REFCURSOR` (see learnRefCursorIDs).
+	// Its sql is the call's, annotated, so it reads as a PL/SQL block; the flag
+	// is what stops the locator from being offered this execution's own row
+	// stream as if it were another call's out-binds.
+	fromRefCursorBind bool
+
+	// cursorIDSource ranks the evidence behind cursorID, so a better reading can
+	// replace a worse one and never the other way round. See cursorIDSource and
+	// learnCursorID.
+	//
+	// An id that did *not* come from a response leaves this at
+	// cursorIDUnlearned while cursorID is already set — the legacy OALL8 carries
+	// the id on the client's own request, and a REF cursor's comes out of a
+	// call's bind output. That pair means "authoritative, not learned", and
+	// learnCursorID refuses to touch it: neither value is something a scan over a
+	// response may second-guess.
+	cursorIDSource cursorIDSource
 }
 
 // oracleQueryTracker manages per-session cursor state and pending queries.
@@ -174,6 +210,10 @@ type pendingOracleQuery struct {
 	queryUID       uuid.UUID // Set after query record is created in DB
 	queryPersisted bool      // True after query record is created
 	lastRow        []string  // Last captured row values (for continuation packet duplicate tracking)
+
+	// refCursorsLearned is set once this execution's bind output has yielded
+	// REF cursor ids, so the rest of its response packets are not walked again.
+	refCursorsLearned bool
 
 	// rowSink batches this query's captured rows through the shared writer.
 	// Created by persistQueryRecord, i.e. only once the parent queries row
@@ -403,10 +443,13 @@ func (s *session) handleCursorReexec(cursorID uint16) error {
 }
 
 // refuseUnknownCursor decides what to do with a re-execution naming a cursor
-// dbbat never saw parsed. Both frames that can only be identified by cursor id
-// route through here — the SQL-less OALL8 and the piggyback re-execution every
-// modern thin client sends — so the wire op a client picks cannot change the
-// answer. The statement it would run is unknown, so:
+// dbbat never saw parsed. Every frame that can only be identified by cursor id
+// routes through here — the SQL-less OALL8, the piggyback re-execution every
+// modern thin client sends, and the `03 5e` declaring no statement, in ojdbc6's
+// thin header and in the wide one an OCI client drives a cursor with
+// (execNoStatementCursor) — so neither the wire op a client picks nor the
+// encoding it writes can change the answer. The statement it would run is
+// unknown, so:
 //
 //   - under a grant carrying statement-shaped controls, it fails closed — a
 //     restrictive grant must not be bypassable by an execution the proxy cannot
@@ -476,8 +519,9 @@ func (s *session) hasStatementControls() bool {
 // pending query for this execution. Same order as the SQL-carrying path, so a
 // re-execution is enforced exactly like the parse that created the cursor.
 //
-// This is the single quota-check insertion point for both re-execution frames:
-// the SQL-less OALL8 (handleCursorReexec) and the piggyback re-execution
+// This is the single quota-check insertion point for every re-execution frame:
+// the SQL-less OALL8 and the statement-less `03 5e` (both via
+// handleCursorReexec) and the piggyback re-execution
 // (handlePiggybackReexec). Each resolves its cursor before delegating here,
 // which is deliberate — a cursor dbbat never saw parsed keeps answering
 // refuseUnknownCursor even when the grant is also exhausted. That refusal is
@@ -596,32 +640,164 @@ func (s *session) handlePiggybackReexec(ttcPayload []byte) error {
 // SQL.
 //
 // Only the legacy OALL8 carries the cursor id on the request; the piggyback and
-// JDBC exec paths leave dbbat to read it off the response. Learning is a
-// one-shot per statement — a cursor that already has an id is never re-read —
-// which is what keeps the anchored scan in findCursorIDInResponse from being
-// re-run against row-stream bytes for the rest of a fetch.
+// JDBC exec paths leave dbbat to read it off the response.
+//
+// Learning used to be a flat one-shot: the first value findCursorIDInResponse
+// returned won and the cursor was never re-read, which kept the anchored scan
+// from churning the id against row-stream bytes for the rest of a fetch. The
+// property was worth keeping; the rule was the wrong way to get it, because it
+// also meant the *first* value won even when it was the worst one available.
+// Measured live against a real 23ai server, a sqlplus fetch whose end-of-call
+// terminator correctly named cursor 2 ran on a session holding **17744** — a
+// value the scan took off the QueryResult's describe records, latched before the
+// terminator arrived, and never revisited. That is the id rememberCursor files
+// the statement under, so
+// it is the id a later re-execution is gated against: the real id 2 is simply
+// never written, and an id the server recycles onto 17744 would resolve to the
+// wrong statement's SQL rather than being refused as unknown.
+//
+// So the id is ranked rather than latched (see cursorIDSource). A reading
+// replaces the stored one only when it is *stronger* evidence, which keeps the
+// original property intact — a scan hit never outranks a scan hit, so a fetch's
+// row bytes still cannot churn the id — while letting the server's own
+// end-of-call object correct a guess made before it arrived. Two things that are
+// not readings at all outrank every source: an id the client's request carried
+// (the legacy OALL8) and one read out of a call's bind output (a REF cursor).
+// Both are recognized by cursorID being set while the source is still
+// cursorIDUnlearned.
+//
+// When a correction changes the id, the entry the wrong one was filed under is
+// dropped. Leaving it is the whole gating hazard restated: a stale map entry
+// pointing at a statement it never named, waiting for the server to recycle that
+// id onto a real cursor.
 //
 // Runs on the upstream leg, so the caller holds trackerMu (see
 // interceptUpstreamMessage) — it writes into the in-flight query's cursor and
 // into the tracker's map, both of which the client leg also owns.
-func (s *session) learnCursorID(ttcPayload []byte) {
+//
+// `funcCode` is the TTC function code of the packet the payload came in as,
+// which is what separates a scan hit on a packet that carries the call's OER
+// from one on a packet whose payload is data — the QueryResult's describe
+// records above all. It never changes what is learned, only the rank the
+// learning is filed under (see cursorIDSource).
+func (s *session) learnCursorID(funcCode TTCFunctionCode, ttcPayload []byte) {
 	pending := s.tracker.pendingQuery
-	if pending == nil || pending.cursor == nil || pending.cursor.cursorID != 0 {
+	if pending == nil || pending.cursor == nil {
 		return
 	}
 
-	cursorID, ok := findCursorIDInResponse(s.oerShapeSnapshot(), ttcPayload)
-	if !ok {
+	cursor := pending.cursor
+
+	// Set, but by something other than a reading of a response: authoritative.
+	if cursor.cursorID != 0 && cursor.cursorIDSource == cursorIDUnlearned {
 		return
 	}
 
-	pending.cursor.cursorID = cursorID
-	s.rememberCursor(cursorID, pending.cursor)
+	cursorID, source := findCursorIDInResponse(s.oerShapeSnapshot(), ttcPayload, s.rowStreamActive(), funcCode)
+	if source <= cursor.cursorIDSource {
+		return
+	}
+
+	previous := cursor.cursorID
+
+	cursor.cursorID = cursorID
+	cursor.cursorIDSource = source
+
+	// The correction's other half: the id this statement was wrongly filed under
+	// must stop resolving to it. Only when the entry is still this very cursor —
+	// something else may have claimed the id since, and that claim is newer.
+	if previous != 0 && previous != cursorID && s.tracker.cursors[previous] == cursor {
+		s.forgetCursor(previous)
+	}
+
+	s.rememberCursor(cursorID, cursor)
 
 	s.logger.DebugContext(s.ctx, logMsgLearnedCursorID,
 		slog.Uint64("cursor_id", uint64(cursorID)),
-		slog.String("sql", truncateSQL(pending.cursor.sql, 200)),
+		slog.String("source", source.String()),
+		slog.Uint64("previous_cursor_id", uint64(previous)),
+		slog.String("sql", truncateSQL(cursor.sql, 200)),
 	)
+}
+
+// refCursorNote is appended to the SQL a cursor learned from a call's bind
+// output carries. It is a SQL comment, so the static validators and the approval
+// patterns — which run on the comment-stripped scratch copy
+// (shared.NormalizeSQL / matchableSQL) — match exactly what they matched when
+// the call itself was gated, while /queries stops implying dbbat saw a statement
+// it never did.
+//
+// The text it annotates is the **call**, deliberately. The `OPEN p FOR SELECT …`
+// inside the procedure never crossed the wire, so the SELECT is not something
+// dbbat can know; the call is, it is the statement the grant already gated once,
+// and it is the right thing to charge this execution's quota and audit row to.
+const refCursorNote = " /* dbbat: a SYS_REFCURSOR this call returned; the cursor's own " +
+	"statement was opened inside the procedure and never crossed the wire */"
+
+// markRefCursorStatement annotates the call a REF cursor was handed back by.
+func markRefCursorStatement(sql string) string {
+	return sql + refCursorNote
+}
+
+// learnRefCursorIDs records the cursor ids the server reported as
+// `SYS_REFCURSOR` out-binds of the PL/SQL call currently in flight, so the
+// fetches the client then drives on them resolve instead of being refused.
+//
+// This is the one cursor id that has no OER to be read off — see
+// refcursor_bind.go — and until it existed a REF cursor was the single known
+// shape where ordinary read-only application code met refuseUnknownCursor's
+// fail-closed branch and became ORA-01031.
+//
+// Two gates keep it from running anywhere it could misfire, and neither is
+// cosmetic:
+//
+//   - **only while a PL/SQL call is in flight.** A `0x07` message is also what
+//     carries ordinary row data, so a locator offered every response would be
+//     walking rows. An out-bind REF cursor can only come back from an anonymous
+//     block or a CALL, which is a property of the statement dbbat already holds.
+//   - **never while the in-flight statement is itself a learned REF cursor.**
+//     Its text starts with the call's `BEGIN`, so it would pass the gate above
+//     while what is actually streaming back is the cursor's rows.
+//
+// Learning is one-shot per execution: once a call has yielded ids, its remaining
+// response packets are left alone. A fresh execution of the same call gets a
+// fresh pending query and so a fresh chance, which is what keeps up with the
+// server handing out a new id per `OPEN`.
+//
+// Runs on the upstream leg, so the caller holds trackerMu (see
+// interceptUpstreamMessage).
+func (s *session) learnRefCursorIDs(ttcPayload []byte) {
+	pending := s.tracker.pendingQuery
+	if pending == nil || pending.cursor == nil || pending.refCursorsLearned {
+		return
+	}
+
+	if pending.cursor.fromRefCursorBind || !statementIsAPLSQLCall(pending.cursor.sql) {
+		return
+	}
+
+	ids := refCursorIDsInBindOutput(s.oerShapeSnapshot(), ttcPayload)
+	if len(ids) == 0 {
+		return
+	}
+
+	pending.refCursorsLearned = true
+	sql := markRefCursorStatement(pending.cursor.sql)
+
+	for _, id := range ids {
+		s.rememberCursor(id, &trackedCursor{
+			cursorID:          id,
+			sql:               sql,
+			bindValues:        pending.cursor.bindValues,
+			parsedAt:          time.Now(),
+			fromRefCursorBind: true,
+		})
+
+		s.logger.DebugContext(s.ctx, logMsgLearnedRefCursorID,
+			slog.Uint64("cursor_id", uint64(id)),
+			slog.String("sql", truncateSQL(sql, 200)),
+		)
+	}
 }
 
 // flushPendingQuery completes any outstanding query that hasn't been finalized.
@@ -648,9 +824,20 @@ func (s *session) flushPendingQuery() {
 
 // handlePiggybackExec intercepts a v315+ piggyback execute-with-SQL message.
 func (s *session) handlePiggybackExec(ttcPayload []byte) error {
-	result, err := decodePiggybackExecSQL(ttcPayload)
+	result, err := decodePiggybackExecSQL(ttcPayload, s.clientWide64Encoding)
 	if err != nil {
+		// A `03 5e` whose header declares a zero-length statement is a
+		// re-execution of a cursor already parsed — ojdbc6's way of re-running a
+		// PreparedStatement — not a frame dbbat failed to read. It is gated
+		// against that cursor's SQL, exactly like the SQL-less OALL8 and the
+		// `03 4e` / `03 04` piggyback. See execNoStatementCursor.
+		var noSQL *PiggybackExecNoSQLError
+		if errors.As(err, &noSQL) {
+			return s.handleCursorReexec(noSQL.CursorID)
+		}
+
 		s.logger.DebugContext(s.ctx, "failed to decode piggyback exec", slog.Any("error", err))
+
 		return nil // Don't block on decode failure
 	}
 
@@ -739,8 +926,15 @@ func (s *session) handlePiggybackExec(ttcPayload []byte) error {
 // Returns a non-nil error when the statement must not be forwarded; the caller
 // answers the client with a TTC error instead.
 func (s *session) handleJDBCExec(ttcPayload []byte) error {
-	result, err := decodeExecSQL(ttcPayload)
+	result, err := decodeExecSQL(ttcPayload, s.clientWide64Encoding)
 	if err != nil {
+		// The stapled-execute twin of the frame handlePiggybackExec gates: an
+		// execute declaring no statement is a re-execution of a tracked cursor.
+		var noSQL *PiggybackExecNoSQLError
+		if errors.As(err, &noSQL) {
+			return s.handleCursorReexec(noSQL.CursorID)
+		}
+
 		s.logger.DebugContext(s.ctx, "failed to decode JDBC exec", slog.Any("error", err))
 		// Don't block on decode failure — let it pass through, as OALL8 does.
 		// See the Oracle caveat in docs/approvals.md.
@@ -836,7 +1030,7 @@ func (s *session) handleJDBCExec(ttcPayload []byte) error {
 //
 // Callers hold trackerMu (see interceptUpstreamMessage).
 func (s *session) handleQueryResultV2(ttcPayload []byte) {
-	result := decodeQueryResultV2(ttcPayload)
+	result := decodeQueryResultV2(ttcPayload, s.oerShapeSnapshot().fixedWidth)
 	if result == nil {
 		return
 	}

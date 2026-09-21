@@ -505,6 +505,91 @@ func TestIntegration_StatementTagFromOCIClient(t *testing.T) {
 		"Oracle's own view of the OCI client's statement must carry the tag:\n%s", out)
 }
 
+// sqlplusPLSQLTagProbeScript is the shape a thick-client user actually types:
+// an anonymous PL/SQL block with a **bind**, which sqlplus staples behind a
+// close-cursors piggyback, followed by the `PRINT` that drives the REF cursor
+// the call handed back.
+//
+// The two lookups split the marker with `||` so neither matches itself, and both
+// anchor on `BEGIN dbbat_tag_refcur` rather than on the procedure name alone —
+// the `CREATE OR REPLACE PROCEDURE` that made it, and the `DROP` that removes
+// it, both carry that name and neither is the statement under test.
+const sqlplusPLSQLTagProbeScript = `SET PAGESIZE 0
+SET FEEDBACK OFF
+VARIABLE rc REFCURSOR
+BEGIN dbbat_tag_refcur(:rc); END;
+/
+PRINT rc
+SELECT 'tagged=' || COUNT(*) FROM v$sql WHERE sql_text LIKE '%BEGIN dbbat' || '_tag_refcur%' AND sql_text LIKE '/*dbbat=''%';
+SELECT 'untagged=' || COUNT(*) FROM v$sql WHERE sql_text LIKE '%BEGIN dbbat' || '_tag_refcur%' AND sql_text NOT LIKE '/*dbbat=''%';
+EXIT
+`
+
+// TestIntegration_StatementTagFromOCIPLSQLCall is the shape this feature was
+// once believed not to reach.
+//
+// An sqlplus session running `VARIABLE rc REFCURSOR` / `BEGIN proc(:rc); END;`
+// puts an anonymous PL/SQL block carrying a bind on the wire, stapled behind a
+// close-cursors piggyback, and that frame looked for a while like one the exact
+// locator could not certify — which would have meant a thick client doing PL/SQL
+// with binds, most of what a DBA does from sqlplus, running untagged. It is not:
+// the refusals were the `PRINT rc` drives, which declare no statement at all
+// (execWideNoStatementCursor).
+//
+// So this is the live version of that correction, and it asserts both halves at
+// once. The block must come back **tagged** in Oracle's own view — with no
+// untagged twin, which is what a per-frame inconsistency would look like in
+// `V$SQL` — and the REF cursor the call handed back must still drive and return
+// its rows, which is what says the rewritten frame's bind survived the length
+// field moving.
+//
+// Measured 2026-09-21 against `gvenzl/oracle-free:23-slim` with Instant Client
+// 23.3 on PATH: `tagged=1`, `untagged=0`, `refcur-3`.
+//
+// Like TestIntegration_StatementTagFromOCIClient above, it asserts `tagged=1`,
+// so it is red against the **64-bit** OCI dialect
+// (`ORACLE_TEST_OCI_CLIENT=container`) — where the locator does not read the
+// header at all and the session runs untagged by design. That is one gap, not
+// two, and it is already filed:
+// specs/todos/2026-09-21-02-oracle-statement-tag-never-reaches-the-64-bit-oci-client.md.
+// Whatever fixes that test fixes this one.
+func TestIntegration_StatementTagFromOCIPLSQLCall(t *testing.T) {
+	env := startOracleThroughProxyWith(t, oracleFixtureOptions{
+		statementTagging:        true,
+		reachableFromContainers: plannedOCIClient() == ociClientContainer,
+	})
+
+	client := requireOCIClient(t, env)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	_, err := env.db.ExecContext(ctx, `CREATE OR REPLACE PROCEDURE dbbat_tag_refcur(p OUT SYS_REFCURSOR) AS
+BEGIN
+  OPEN p FOR SELECT 'refcur-' || LEVEL AS label FROM dual CONNECT BY LEVEL <= 3;
+END;`)
+	require.NoError(t, err, "the procedure must be creatable under the permissive grant the fixture starts with")
+
+	defer func() { _, _ = env.db.ExecContext(context.Background(), "DROP PROCEDURE dbbat_tag_refcur") }()
+
+	out, err := client.run(t, ctx, sqlplusPLSQLTagProbeScript)
+	require.NoErrorf(t, err, "sqlplus through a tagging proxy:\n%s", out)
+
+	t.Logf("%s output:\n%s", client.label, out)
+
+	assert.NotContains(t, out, "ORA-03146",
+		"a wrong TTC length field is what this whole design exists to avoid:\n%s", out)
+	assert.NotContains(t, out, "ORA-03120",
+		"a desynchronized message reads as a conversion overflow:\n%s", out)
+	assert.Contains(t, out, "refcur-3",
+		"the REF cursor the tagged call handed back must still drive and return its rows:\n%s", out)
+	assert.Contains(t, out, "tagged=1",
+		"Oracle's own view of the PL/SQL call must carry the tag:\n%s", out)
+	assert.Contains(t, out, "untagged=0",
+		"and there must be no untagged twin of it — that is what a frame tagged on some "+
+			"executions and not others would look like in V$SQL:\n%s", out)
+}
+
 // pythonTagProbeScript is the same probe through python-oracledb thin.
 const pythonTagProbeScript = `import sys
 import oracledb
@@ -557,4 +642,278 @@ func TestIntegration_StatementTagFromPythonThin(t *testing.T) {
 	assert.Contains(t, output, "tagged=1",
 		"Oracle's own view of the thin client's statement must carry the tag:\n%s", output)
 	assert.Contains(t, output, "done", "%s", output)
+}
+
+// --- the fourth shape: ojdbc thin (and sqlcl, which is ojdbc thin) ----------
+//
+// go-ora and python-oracledb both write the statement length as a compressed
+// int followed by a short-form CLR prefix. ojdbc thin does not: it is the
+// `bare` shape, where the header's length field is the statement's *only*
+// declared length and no CLR prefix repeats it. That is the shape where a
+// second copy of the length hiding elsewhere in the frame would be caught by
+// nothing — the corpus test proves the frames dbbat recorded, and only a live
+// run proves the frames ojdbc sends today.
+//
+// The jar is resolved by oracleTestOJDBCJar (blocked_integration_test.go):
+// ORACLE_TEST_OJDBC_JAR, or an ojdbc jar on CLASSPATH. CI fetches one and
+// exports the variable, and with it set neither a missing jar nor a missing JVM
+// is allowed to become a skip — the whole point of asking for this coverage is
+// getting it.
+
+// jdbcTagProgram runs a marked statement through the proxy, re-executes a
+// second marked statement 25 times off one prepared handle, and then reads both
+// back out of V$SQL — which is where Oracle's own tooling would see the tag.
+//
+// It is run through `java Tag.java` (single-file source mode), so no build
+// tooling beyond a JDK is involved; the file must therefore be named Tag.java.
+//
+// Every V$SQL lookup splits its own marker with `||` so that the lookup does
+// not match itself: after `dbbat` the text carries `' || '`, which no
+// `%dbbat_jdbc_probe%` pattern spans.
+const jdbcTagProgram = `import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.Statement;
+
+public class Tag {
+    public static void main(String[] args) throws Exception {
+        String url = String.format("jdbc:oracle:thin:@//%s:%s/%s", args[0], args[1], args[2]);
+
+        try (Connection conn = DriverManager.getConnection(url, args[3], args[4])) {
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                     "SELECT 'probe=' || 1 FROM dual WHERE 'dbbat_jdbc_probe' = 'dbbat_jdbc_probe'")) {
+                rs.next();
+                System.out.println(rs.getString(1));
+            }
+
+            // The per-user cardinality claim on a client that prepares once and
+            // re-executes rather than re-parsing: 25 executions, one SQL_ID.
+            try (PreparedStatement ps = conn.prepareStatement(
+                     "SELECT 'card=' || 1 FROM dual WHERE 'dbbat_jdbc_card' = 'dbbat_jdbc_card'")) {
+                for (int i = 0; i < 25; i++) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                    }
+                }
+            }
+
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                     "SELECT sql_text FROM v$sql WHERE sql_text LIKE '%dbbat' || '_jdbc_probe%'")) {
+                int tagged = 0;
+                int seen = 0;
+                while (rs.next()) {
+                    String text = rs.getString(1);
+                    seen++;
+                    System.out.println("VSQL: " + text.substring(0, Math.min(100, text.length())));
+                    if (text.startsWith("/*dbbat='")) {
+                        tagged++;
+                    }
+                }
+                System.out.println("seen=" + seen);
+                System.out.println("tagged=" + tagged);
+            }
+
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                     "SELECT COUNT(DISTINCT sql_id) FROM v$sql WHERE sql_text LIKE '%dbbat' || '_jdbc_card%'")) {
+                rs.next();
+                System.out.println("cards=" + rs.getInt(1));
+            }
+        }
+
+        System.out.println("done");
+    }
+}
+`
+
+// jdbcTagDeadline is the probe's budget. It is a deadlock detector rather than
+// a performance bound — a tagged statement that comes back at all comes back in
+// a round trip — with room for the JVM: single-file source mode compiles
+// Tag.java in-process before running it, and the JDBC driver's connect is
+// slower to start than a thin client's.
+const jdbcTagDeadline = 3 * time.Minute
+
+// TestIntegration_StatementTagFromJDBCThin is the fourth client shape on a real
+// server, and the one the feature shipped without: `bare`, where the header's
+// length field is the statement's only declared length.
+//
+// It also carries the cardinality half of the cost argument for this client
+// class specifically. TestIntegration_StatementTagCostsOneCursorPerUser makes
+// the same measurement through go-ora, which re-sends the statement text on
+// every execution; JDBC prepares once and re-executes, so a tag that varied per
+// execution — or a rewrite applied inconsistently across a session — would show
+// up here as more than one SQL_ID.
+func TestIntegration_StatementTagFromJDBCThin(t *testing.T) {
+	java := requireTestJava(t)
+	if java == "" {
+		t.Skip("java not available")
+	}
+
+	jar := oracleTestOJDBCJar(t)
+	if jar == "" {
+		t.Skipf("no Oracle JDBC driver: set %s to an ojdbc jar, or put one on CLASSPATH", ojdbcJarEnv)
+	}
+
+	env := startOracleThroughProxyWith(t, oracleFixtureOptions{statementTagging: true})
+
+	program := filepath.Join(t.TempDir(), "Tag.java")
+	require.NoError(t, os.WriteFile(program, []byte(jdbcTagProgram), 0o600))
+
+	ctx, cancel := context.WithTimeout(context.Background(), jdbcTagDeadline)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, java, "-cp", jar, program,
+		env.host, strconv.Itoa(env.port), env.service, env.username, env.apiKey).CombinedOutput()
+
+	output := string(out)
+	require.NoErrorf(t, err, "JDBC thin through a tagging proxy:\n%s", output)
+
+	assert.NotContains(t, output, "ORA-03146",
+		"a wrong TTC length field is what this whole design exists to avoid:\n%s", output)
+	assert.NotContains(t, output, "ORA-03120",
+		"a desynchronized message reads as a conversion overflow:\n%s", output)
+	assert.Contains(t, output, "probe=1", "the statement must have run:\n%s", output)
+	assert.Contains(t, output, "tagged=1",
+		"Oracle's own view of the JDBC thin client's statement must carry the tag — the `bare` "+
+			"shape is the one where the header length is the statement's only declared length:\n%s", output)
+	assert.Contains(t, output, "cards=1",
+		"25 executions of one prepared statement under one identity must be one shared-pool "+
+			"entry, which is the per-user cardinality claim:\n%s", output)
+	assert.Contains(t, output, "done", "the client must close cleanly:\n%s", output)
+
+	// And the storage invariant, read from dbbat's own side: the tag is on the
+	// wire and nowhere else.
+	for _, sqlText := range recordedStatements(t, env) {
+		assert.NotContains(t, sqlText, "/*dbbat='", "no recorded statement may carry the tag")
+	}
+}
+
+// sqlclEnv points the sqlcl probe below at a SQLcl launcher (`sql`, or `sql.exe`
+// on Windows). Like the ojdbc jar there is nothing to look up — SQLcl is a
+// downloaded zip or a Homebrew cask, not a packaged driver — so the knob is an
+// explicit path, with a `sql` on PATH honoured when it identifies itself as
+// SQLcl.
+const sqlclEnv = "ORACLE_TEST_SQLCL"
+
+// sqlclTagProbeScript is the sqlplus probe's wording through SQLcl: run a
+// marked statement, then count the tagged V$SQL entries for it.
+//
+// The lookup splits its own marker with `||` for the same reason the sqlplus
+// one does — otherwise it matches itself and the count is about the wrong
+// statement.
+const sqlclTagProbeScript = `SET PAGESIZE 0
+SET FEEDBACK OFF
+SELECT 'probe=' || 1 FROM dual WHERE 'dbbat_sqlcl_probe' = 'dbbat_sqlcl_probe';
+SELECT 'tagged=' || COUNT(*) FROM v$sql WHERE sql_text LIKE '%dbbat' || '_sqlcl_probe%' AND sql_text LIKE '/*dbbat=''%';
+EXIT
+`
+
+// sqlclVersionDeadline bounds the identification probe below. SQLcl is a JVM
+// launcher, so `-V` is seconds rather than milliseconds — but a wedged one is
+// one of the ways this client "stops working", and a hang until the package
+// timeout would report that as the whole suite dying rather than as SQLcl.
+const sqlclVersionDeadline = 2 * time.Minute
+
+// sqlclVersionOutput asks a launcher what it is. A `sql` is a common enough
+// name to be something else entirely (a shell alias, another vendor's tool),
+// so nothing is believed to be SQLcl until it says so itself.
+func sqlclVersionOutput(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sqlclVersionDeadline)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, path, "-V").CombinedOutput()
+
+	return string(out), err
+}
+
+// oracleTestSQLcl resolves a SQLcl launcher, or "" when this machine has none.
+//
+// sqlclEnv is this client's require switch, exactly as ojdbcJarEnv is the JDK's
+// in requireTestJava: setting it is someone asking for this coverage, so every
+// way of then not getting it — a path that is not there, a launcher that will
+// not start, one that starts but turns out not to be SQLcl — is a failure
+// rather than a skip. Only the last of those used to be checked, and only on
+// the PATH branch, so an explicit path at a broken install produced a murky
+// exec error from the probe itself and a *broken install on PATH* produced a
+// silent skip.
+//
+// There is deliberately no separate ORACLE_TEST_REQUIRE_SQLCL knob the way
+// there is for the OCI client. That one exists because CI sets it on every
+// Oracle leg while naming no path; no CI leg runs SQLcl at all (see
+// docs/oracle.md, "Why SQLcl is a developer-machine client"), so the only
+// caller who can ask for this coverage is a developer who already had to name
+// a launcher — which makes sqlclEnv itself the request, with nothing left for
+// a second variable to say.
+//
+// Without the variable, a machine that has no SQLcl is just an environment
+// fact and the caller skips.
+func oracleTestSQLcl(t *testing.T) string {
+	t.Helper()
+
+	if path := os.Getenv(sqlclEnv); path != "" {
+		_, err := os.Stat(path)
+		require.NoErrorf(t, err, "%s points at a launcher that is not there", sqlclEnv)
+
+		out, err := sqlclVersionOutput(path)
+		require.NoErrorf(t, err, "%s points at a launcher that will not run:\n%s", sqlclEnv, out)
+		require.Containsf(t, out, "SQLcl",
+			"%s points at something that does not identify itself as SQLcl:\n%s", sqlclEnv, out)
+
+		return path
+	}
+
+	sqlcl, err := exec.LookPath("sql")
+	if err != nil {
+		return ""
+	}
+
+	out, err := sqlclVersionOutput(sqlcl)
+	if err != nil || !strings.Contains(out, "SQLcl") {
+		return ""
+	}
+
+	return sqlcl
+}
+
+// TestIntegration_StatementTagFromSQLcl is the same wire shape as the JDBC test
+// above — SQLcl is ojdbc thin under the hood — so what it buys is client
+// *version* coverage: SQLcl ships its own bundled driver, generally newer than
+// whatever jar a developer or CI happens to have, and it is the client the
+// `bare` corpus fixtures were captured from (sqlcl_regression_test.go).
+//
+// Skipped when no SQLcl is reachable, which is most machines and every CI
+// runner — by decision, not by accident: see docs/oracle.md, "Why SQLcl is a
+// developer-machine client". The jar-driven test above is the one CI is wired
+// for, and it is what gates the `bare` shape there. Set sqlclEnv and this stops
+// being allowed to skip for any reason.
+func TestIntegration_StatementTagFromSQLcl(t *testing.T) {
+	sqlcl := oracleTestSQLcl(t)
+	if sqlcl == "" {
+		t.Skipf("no SQLcl: set %s to a `sql` launcher, or put one on PATH", sqlclEnv)
+	}
+
+	t.Logf("SQLcl: %s", sqlcl)
+
+	env := startOracleThroughProxyWith(t, oracleFixtureOptions{statementTagging: true})
+
+	script := filepath.Join(t.TempDir(), "sqlcl_tag_probe.sql")
+	require.NoError(t, os.WriteFile(script, []byte(sqlclTagProbeScript), 0o600))
+
+	ctx, cancel := context.WithTimeout(context.Background(), jdbcTagDeadline)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, sqlcl, "-S",
+		env.ociConnectStringAt(env.host, env.port), "@"+script).CombinedOutput()
+
+	output := string(out)
+	require.NoErrorf(t, err, "SQLcl through a tagging proxy:\n%s", output)
+
+	assert.NotContains(t, output, "ORA-03146", "%s", output)
+	assert.NotContains(t, output, "ORA-03120", "%s", output)
+	assert.Contains(t, output, "probe=1", "the statement must have run:\n%s", output)
+	assert.Contains(t, output, "tagged=1",
+		"Oracle's own view of SQLcl's statement must carry the tag:\n%s", output)
 }
