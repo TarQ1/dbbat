@@ -22,6 +22,7 @@ import (
 	"github.com/fclairamb/dbbat/internal/config"
 	"github.com/fclairamb/dbbat/internal/crypto"
 	"github.com/fclairamb/dbbat/internal/dump"
+	"github.com/fclairamb/dbbat/internal/dump/decode"
 	"github.com/fclairamb/dbbat/internal/events"
 	"github.com/fclairamb/dbbat/internal/notify"
 	"github.com/fclairamb/dbbat/internal/proxy/mongodb"
@@ -411,23 +412,29 @@ func startProxies(
 		mssql:    startMSSQLProxy(ctx, cfg, dataStore, authCache, approvalDeps, rowWriter, logger),
 	}
 
-	// One resolver for the whole process: the store memoizes the parameter, so
-	// five resolvers would share one cache anyway, but building them here keeps
-	// the "who imposes the limit" wiring in one place.
+	// One resolver for the whole process: the store memoizes the parameters,
+	// so five resolvers would share one cache anyway, but building them here
+	// keeps the "who imposes the limit / who decides the tag" wiring in one
+	// place.
 	statementTimeouts := shared.NewStatementTimeoutResolver(dataStore, cfg)
+	queryTagging := shared.NewQueryTaggingResolver(dataStore, cfg)
 
 	set.postgres.SetStatementTimeouts(statementTimeouts)
+	set.postgres.SetQueryTaggingResolver(queryTagging)
 
 	if set.oracle != nil {
 		set.oracle.SetStatementTimeouts(statementTimeouts)
+		set.oracle.SetQueryTaggingResolver(queryTagging)
 	}
 
 	if set.mysql != nil {
 		set.mysql.SetStatementTimeouts(statementTimeouts)
+		set.mysql.SetQueryTaggingResolver(queryTagging)
 	}
 
 	if set.mongo != nil {
 		set.mongo.SetStatementTimeouts(statementTimeouts)
+		set.mongo.SetQueryTaggingResolver(queryTagging)
 	}
 
 	if set.mssql != nil {
@@ -439,6 +446,11 @@ func startProxies(
 	// `comment` command field on MongoDB. Oracle is deliberately absent —
 	// V$SQL deduplicates on statement text, so a per-connection tag would
 	// defeat its shared-cursor cache — and so is SQL Server.
+	//
+	// These SetQueryTagging calls now only carry the DBB_QUERY_TAGGING
+	// *default* each proxy falls back to when the store is unreadable; the
+	// resolvers installed above decide per session, from the tagging.*
+	// parameters the Settings page edits.
 	if cfg.QueryTagging.Enabled {
 		set.postgres.SetQueryTagging(true)
 
@@ -1652,6 +1664,22 @@ func dumpCommand() *cli.Command {
 					return runDumpAnonymise(cmd)
 				},
 			},
+			{
+				Name: "decode",
+				Usage: "Print a capture as one line per protocol message, both directions " +
+					"(PostgreSQL, MySQL, MongoDB, SQL Server and Oracle)",
+				ArgsUsage: "<input-file>",
+				Flags: []cli.Flag{
+					&cli.BoolFlag{
+						Name: "rows",
+						Usage: "print result-row and bind-parameter values instead of their counts " +
+							"(authentication payloads stay redacted either way)",
+					},
+				},
+				Action: func(_ context.Context, cmd *cli.Command) error {
+					return runDumpDecode(cmd)
+				},
+			},
 		},
 	}
 }
@@ -1867,6 +1895,25 @@ func runDumpAnonymise(cmd *cli.Command) error {
 		"path", outputPath,
 		"addresses_rewritten", rewriteAddresses,
 	)
+
+	return nil
+}
+
+var errDumpDecodeUsage = errors.New("usage: dbbat dump decode [--rows] <input-file>")
+
+// runDumpDecode prints a capture as a protocol trace on stdout: one line per
+// message, both directions, values redacted unless --rows was given.
+func runDumpDecode(cmd *cli.Command) error {
+	args := cmd.Args()
+	if args.Len() < 1 {
+		return errDumpDecodeUsage
+	}
+
+	opts := decode.Options{ShowRows: cmd.Bool("rows")}
+
+	if err := decode.File(args.Get(0), opts, os.Stdout); err != nil {
+		return fmt.Errorf("decode failed: %w", err)
+	}
 
 	return nil
 }

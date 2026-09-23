@@ -92,14 +92,21 @@ PRINT n
 EXIT
 `)
 
-	_, err = env.db.ExecContext(ctx, ociDescribeObjectType)
-	require.NoError(t, err)
+	for _, ddl := range ociDescribeObjectTypes {
+		_, err = env.db.ExecContext(ctx, ddl)
+		require.NoErrorf(t, err, "creating the describe query's object types: %s", ddl)
+	}
 
-	defer func() { _, _ = env.db.ExecContext(ctx, "DROP TYPE dbbat_cap_obj") }()
+	defer func() {
+		for _, name := range ociDescribeObjectTypeNames {
+			_, _ = env.db.ExecContext(ctx, "DROP TYPE "+name)
+		}
+	}()
 
 	describeDump := recordOCIScriptThroughProxy(t, env, oci, "capture-oci-describe", `SET PAGESIZE 0
 SET FEEDBACK OFF
 `+ociDescribeQuery+`
+`+ociDescribeTypedQuery+`
 EXIT
 `)
 
@@ -120,6 +127,159 @@ EXIT
 	if wide64 {
 		writeStatementFrameHexFixture(t, refCursorDump, oci64ParseExecsFixture, "dbbat_cap_refcur")
 	}
+}
+
+// TestCapture_OCILOBFetchThroughDBBat re-records the LOB fetch fixture.
+//
+//	ORACLE_CAPTURE_OCI_FIXTURES=1 ORACLE_TEST_OCI_CLIENT=container \
+//	  go test -tags integration -run TestCapture_OCILOBFetchThroughDBBat ./internal/proxy/oracle/
+//
+// It is a capture of its own rather than a fourth script in the test above
+// because it needs nothing that one sets up — no procedures, no object types —
+// and because the fixture it writes is the one a failure in any of the others
+// must not take down with it.
+func TestCapture_OCILOBFetchThroughDBBat(t *testing.T) {
+	if os.Getenv(ociFixtureCaptureEnv) != "1" {
+		t.Skipf("set %s=1 to re-record the OCI fixtures", ociFixtureCaptureEnv)
+	}
+
+	env := startOracleThroughProxyForOCI(t, nil)
+	oci := requireOCIClient(t, env)
+
+	lobDump := recordOCIScriptThroughProxy(t, env, oci, "capture-oci-lob", `SET PAGESIZE 0
+SET FEEDBACK OFF
+`+ociLOBQuery+`
+EXIT
+`)
+
+	fixture := ociLOBFixture
+	if recordedDialectIsWide64(t, lobDump) {
+		fixture = oci64LOBFixture
+	}
+
+	writeLOBFetchHexFixture(t, lobDump, fixture)
+}
+
+// TestCapture_OCILongFetchThroughDBBat records a fetch whose select list
+// carries a genuine LONG and a genuine LONG RAW column, on whichever OCI
+// dialect the client speaks.
+//
+//	ORACLE_CAPTURE_OCI_FIXTURES=1 \
+//	  go test -tags integration -run TestCapture_OCILongFetchThroughDBBat ./internal/proxy/oracle/
+//
+// It is the OCI half of the LONG evidence, and it had to be recorded rather
+// than assumed: both OCI dialects frame a *LOB* column their own way, two bytes
+// apart from each other and nothing like the thin one, so there was no reason
+// to expect them to agree with thin about a LONG one either.
+//
+// Unlike every other capture here it needs tables — Oracle allows one LONG
+// column per table and none in a `FROM dual` expression list — so it builds
+// them through the proxy's own go-ora connection first.
+func TestCapture_OCILongFetchThroughDBBat(t *testing.T) {
+	if os.Getenv(ociFixtureCaptureEnv) != "1" {
+		t.Skipf("set %s=1 to re-record the OCI fixtures", ociFixtureCaptureEnv)
+	}
+
+	env := startOracleThroughProxyForOCI(t, nil)
+	oci := requireOCIClient(t, env)
+
+	ctx := context.Background()
+
+	for _, ddl := range ociLongTableDropDDL {
+		if _, err := env.db.ExecContext(ctx, ddl); err != nil {
+			t.Logf("%s: %v (expected on a first run)", ddl, err)
+		}
+	}
+
+	for _, ddl := range ociLongTableDDL {
+		_, err := env.db.ExecContext(ctx, ddl)
+		require.NoErrorf(t, err, "building the LONG tables: %s", ddl)
+	}
+
+	defer func() {
+		for _, ddl := range ociLongTableDropDDL {
+			_, _ = env.db.ExecContext(ctx, ddl)
+		}
+	}()
+
+	dump := recordOCIScriptThroughProxy(t, env, oci, "capture-oci-long", `SET PAGESIZE 0
+SET FEEDBACK OFF
+SET LONG 200
+`+ociLongQuery+`
+`+ociLongRawQuery+`
+EXIT
+`)
+
+	fixture := ociLongFixture
+	if recordedDialectIsWide64(t, dump) {
+		fixture = oci64LongFixture
+	}
+
+	writeLongFetchHexFixture(t, dump, fixture)
+}
+
+// ociLongTableDropDDL / ociLongTableDDL and ociLongQuery / ociLongRawQuery are
+// longTableDDL and longQuery spelled for sqlplus — the same two tables, the
+// same two rows apiece, the same alternation of six-character scalars around
+// the column under test — with the trailing semicolon sqlplus needs and go-ora
+// reads as a syntax error. They are duplicated rather than shared for the
+// reason the capture procedures above are: that file is behind the `capture`
+// tag and this one is behind `integration`.
+var (
+	ociLongTableDropDDL = []string{
+		`DROP TABLE dbbat_cap_long`,
+		`DROP TABLE dbbat_cap_longraw`,
+	}
+
+	ociLongTableDDL = []string{
+		`CREATE TABLE dbbat_cap_long (n NUMBER, l1 LONG)`,
+		`CREATE TABLE dbbat_cap_longraw (n NUMBER, r1 LONG RAW)`,
+		`INSERT INTO dbbat_cap_long VALUES (1, 'longvalue-0123456789')`,
+		`INSERT INTO dbbat_cap_long VALUES (2, NULL)`,
+		`INSERT INTO dbbat_cap_longraw VALUES (1, HEXTORAW('DEADBEEF'))`,
+		`INSERT INTO dbbat_cap_longraw VALUES (2, NULL)`,
+	}
+)
+
+const (
+	ociLongQuery = `SELECT 'aaaaaa' AS c1, l1, 'bbbbbb' AS c2, 'cccccc' AS c3
+  FROM dbbat_cap_long ORDER BY n;`
+
+	ociLongRawQuery = `SELECT 'dddddd' AS c4, r1, 'eeeeee' AS c5, 'ffffff' AS c6
+  FROM dbbat_cap_longraw ORDER BY n;`
+)
+
+// TestCapture_OCISevenColumnFetchThroughDBBat re-records the seven-column
+// describe, in whichever OCI dialect the client speaks.
+//
+//	ORACLE_CAPTURE_OCI_FIXTURES=1 \
+//	  go test -tags integration -run TestCapture_OCISevenColumnFetchThroughDBBat ./internal/proxy/oracle/
+//
+// It is a capture of its own for the same reason the LOB one is: it needs none
+// of the procedures or object types the fixture test above sets up, and the
+// column count is the entire point of the frames it keeps — folding it into a
+// script that also runs the type-rich describes would put a second query's
+// frames in the same file and leave "which one is the seven" to a reader.
+func TestCapture_OCISevenColumnFetchThroughDBBat(t *testing.T) {
+	if os.Getenv(ociFixtureCaptureEnv) != "1" {
+		t.Skipf("set %s=1 to re-record the OCI fixtures", ociFixtureCaptureEnv)
+	}
+
+	env := startOracleThroughProxyForOCI(t, nil)
+	oci := requireOCIClient(t, env)
+
+	dump := recordOCIScriptThroughProxy(t, env, oci, "capture-oci-sevencols", `SET PAGESIZE 0
+SET FEEDBACK OFF
+`+sevenColumnQuery+`;
+EXIT
+`)
+
+	fixture := ociSevenColumnFixture
+	if recordedDialectIsWide64(t, dump) {
+		fixture = oci64SevenColumnFixture
+	}
+
+	writeDescribeHexFixture(t, dump, fixture)
 }
 
 // refCursorCaptureProcedure and scalarOutBindCaptureProcedure are the two

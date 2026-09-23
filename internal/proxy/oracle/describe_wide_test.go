@@ -17,16 +17,21 @@ const ociDescribes = "testdata/oci_describe.hex"
 // Until this existed, parseColumnDescribes read TTC compressed integers only, so
 // an OCI session's describes never parsed and its column names came from the
 // heuristic scanner — which guesses at what a describe record spells out. The
-// last describe in the fixture is a deliberately awkward one: a
-// `VARCHAR2(4000)` whose maximum length does not fit a byte, a `NUMBER(10,2)`
-// with a real precision and scale, `1/3` whose scale is the -127 float
-// sentinel, temporal types, a `CHAR(5)`, a `RAW`, and an object column whose
-// record carries a non-null 16-byte type OID.
+// session's second describe is a deliberately awkward one: a `VARCHAR2(4000)`
+// whose maximum length does not fit a byte, a `NUMBER(10,2)` with a real
+// precision and scale, `1/3` whose scale is the -127 float sentinel, temporal
+// types, a `CHAR(5)`, a `RAW`, and an object column whose record carries a
+// non-null 16-byte type OID.
 //
-// That last column is the one that settles a question no run of zeros could: the
-// type OID arrives as a four-byte little-endian length of 16 followed by a CLR,
-// which is what says the field is a DLC in this encoding too — and therefore
-// what fixes how many bytes the two integers before it may occupy.
+// That object column is the one that settles a question no run of zeros could:
+// the type OID arrives as a four-byte little-endian length of 16 followed by a
+// CLR, which is what says the field is a DLC in this encoding too — and
+// therefore what fixes how many bytes the two integers before it may occupy.
+//
+// The **third** describe is ociDescribeTypedQuery, recorded later and for the
+// 64-bit dialect's sake (see TestOCI64DescribeRecordsParse). It is asserted here
+// too, against the same expected list, because a column list that only one
+// dialect's walk produces is a column list one walk agrees with itself about.
 func TestOCIDescribeRecordsParse(t *testing.T) {
 	t.Parallel()
 
@@ -37,29 +42,23 @@ func TestOCIDescribeRecordsParse(t *testing.T) {
 		require.NotEmptyf(t, ttc, "frame %d must carry a TTC message", i)
 		require.Equalf(t, byte(TTCFuncQueryResult), ttc[0], "frame %d must be a describe", i)
 
-		assert.NotEmptyf(t, parseColumnDescribes(ttc, true),
+		assert.NotEmptyf(t, parseColumnDescribes(ttc, ociOERShape()),
 			"every describe an OCI session receives must parse under the fixed-width reading: frame %d", i)
 	}
 
-	cols := parseColumnDescribes(extractTTCPayload(frames[len(frames)-1]), true)
+	require.Len(t, frames, 3, "the fixture must carry the login probe and both describes")
 
-	assert.Equal(t, []columnDesc{
-		{Name: "N2", Type: tnsTypeNUMBER},
-		{Name: "BIG", Type: tnsTypeVARCHAR},
-		{Name: "FLT", Type: tnsTypeNUMBER},
-		{Name: "D", Type: tnsTypeDATE},
-		{Name: "TS", Type: tnsTypeTSTZDTY},
-		{Name: "C5", Type: tnsTypeCHAR},
-		{Name: "R", Type: tnsTypeRAW},
-		{Name: "OBJ", Type: ociObjectColumnType},
-	}, cols)
+	assert.Equal(t, ociDescribeColumns,
+		parseColumnDescribes(extractTTCPayload(frames[1]), ociOERShape()))
+	assert.Equal(t, ociDescribeTypedColumns,
+		parseColumnDescribes(extractTTCPayload(frames[2]), ociOERShape()))
 }
 
 // ociObjectColumnType is the TTC type code 23ai reports for an object column in
-// a describe. go-ora names no constant for it — its enum stops at OCIRef (110)
-// and picks up again at JSON (119) — but isKnownTNSType's 60..127 range covers
-// it, which is the alignment proof the walk actually relies on.
-const ociObjectColumnType = 121
+// a describe, under the name the describe fixtures know it by. isKnownTNSType's
+// 60..127 range covers it, which is the alignment proof the walk actually relies
+// on; tnsTypeNamedObject is the same code where the row walk reads it.
+const ociObjectColumnType = tnsTypeNamedObject
 
 // TestOCIDescribeIsNotOfferedToAThinSession is the same gate the REF-cursor walk
 // carries, on the describe path: the encoding comes from the session, so an OCI
@@ -71,9 +70,9 @@ func TestOCIDescribeIsNotOfferedToAThinSession(t *testing.T) {
 
 	oci := extractTTCPayload(recordedFrames(t, ociDescribes)[0])
 
-	assert.NotEmpty(t, parseColumnDescribes(oci, true),
+	assert.NotEmpty(t, parseColumnDescribes(oci, ociOERShape()),
 		"the fixture must parse under the shape it was recorded from")
-	assert.Nil(t, parseColumnDescribes(oci, false),
+	assert.Nil(t, parseColumnDescribes(oci, oerShape{}),
 		"an OCI describe must not be read as a compressed one")
 }
 
@@ -126,11 +125,11 @@ func TestOCIRowCaptureCarriesTheDescribesColumnNames(t *testing.T) {
 				"N2":  "1",
 				"BIG": "x",
 				"FLT": "0.3333333333333333333333333333333333333333",
-				"D":   "2026-09-20 20:11:58",
-				"TS":  "2026-09-20 20:11:58.527544 +00:00",
+				"D":   "2026-09-22 08:24:34",
+				"TS":  "2026-09-22 08:24:34.244767 +00:00",
 				"C5":  "ab   ",
 				"R":   "7a7a",
-				"OBJ": "00000024002202085bf0bee82b6b0146e06303d7a8c0ea1b000000000000000000000000",
+				"OBJ": ociDescribeObjectValue,
 			},
 			scanned: []string{"N2", "BIG", "FLT", "TS", "C5", "OBJ", "SYSTEM", "DBBAT_CAP_OBJ"},
 		},
@@ -156,7 +155,7 @@ func TestOCIRowCaptureCarriesTheDescribesColumnNames(t *testing.T) {
 			s.trackerMu.Unlock()
 
 			require.NotNil(t, s.tracker.pendingQuery, "the fetch must still be open")
-			assert.Equal(t, describeColumnNames(parseColumnDescribes(ttc, true)),
+			assert.Equal(t, describeColumnNames(parseColumnDescribes(ttc, ociOERShape())),
 				columnNamesOf(s.tracker.pendingQuery.cursor.columns),
 				"the cursor must carry the describe's own names")
 

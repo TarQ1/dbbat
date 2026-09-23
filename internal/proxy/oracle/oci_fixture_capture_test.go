@@ -357,22 +357,101 @@ const ociDescribeQuery = `SELECT CAST(1 AS NUMBER(10,2)) AS n2,
        dbbat_cap_obj(1, 'x') AS obj
   FROM dual;`
 
-// oci64DescribeFixture is the 64-bit dialect's describe evidence. **Nothing
-// reads it yet**, and that is the honest status rather than an oversight: the
-// fixed-width column record is wider in that dialect, and the recording is what
-// turns the field boundaries from runs of zeros into measurable ones — a
-// charset id of 873, a maximum character length of 4000, a collation id of
-// 16382, a 16-byte object type OID. It is not enough on its own, because one
-// column carries all three of the variable-length fields at once, so the
-// walk that would consume it is deferred together with the columns it needs:
-// specs/todos/2026-09-21-01-oracle-wide64-column-record-layout.md, which starts
-// by extending the query above. It is recorded now because it comes free with
-// the session that records everything else, and re-recording it later would
-// mean re-recording all of them.
+// ociDescribeTypedQuery is the second describe of the same session, and it
+// exists because the query above conflates three things its object column is
+// all of at once: the only column with a type OID, the only one with a schema
+// and type name, and the **last** column. Every byte the 64-bit dialect's
+// record spent differently on it was therefore equally all three, which is why
+// that record's extra 25 bytes could not be placed from the first recording
+// (specs/todos/2026-09-21-01-oracle-wide64-column-record-layout.md).
+//
+// Each column here separates one of them:
+//
+//   - `obj`, `o` and `objlong` are three object types at type-name lengths 13,
+//     7 and 33, at name lengths 3, 1 and 7. Three samples of one shape at two
+//     independent lengths is what turns "consistent with one record" into a
+//     measured field, and `o` is also the column with a non-empty toID and a
+//     one-character name.
+//   - `x` is a SYS.XMLTYPE: the same shape again at a *schema* length of 3
+//     against `SYSTEM`'s 6 — and, as it turned out, a column whose TTC type
+//     code isKnownTNSType did not cover at all (see tnsTypeOPAQUE).
+//   - `cl` is a CLOB: a column with no OID, schema or type name although its
+//     type is not a scalar one.
+//   - `tail` is an ordinary NUMBER and it is deliberately **last**, so "the
+//     object column" and "the last column" stop being the same record.
+//
+// It is a query of its own rather than five more columns on the one above for a
+// reason measured the moment they were: with a CLOB and an XMLTYPE in the
+// select list, the row capture of that describe's fetch comes back **empty**,
+// so folding them in would have cost
+// TestOCIRowCaptureCarriesTheDescribesColumnNames its row.
+//
+// Why it comes back empty was chased down afterwards and is not what it looked
+// like: the describe here carries no row values *at all*, because Oracle turns
+// row prefetch off when a LOB is in the select list and sends the whole fetch
+// in a packet of its own. So this fixture is the right place for the column
+// records and the wrong one for the rows — the rows are in testdata/oci64_lob.hex,
+// which holds both halves of that round trip (see ociLOBQuery).
+const ociDescribeTypedQuery = `SELECT dbbat_cap_obj(1, 'x') AS obj,
+       dbbat_o(2) AS o,
+       dbbat_cap_object_with_a_long_name(3) AS objlong,
+       XMLTYPE('<a/>') AS x,
+       TO_CLOB('cl') AS cl,
+       CAST(2 AS NUMBER(3)) AS tail
+  FROM dual;`
+
+// oci64DescribeFixture is the 64-bit dialect's describe evidence, and what
+// TestOCI64DescribeRecordsParse and parseColumnDescribeWide64 are pinned
+// against. The recording is what turns that record's field boundaries from runs
+// of zeros into measurable ones — a charset id of 873, a maximum character
+// length of 4000, a collation id of 16382, a version of 1, four 16-byte type
+// OIDs and three type names at three different lengths.
+//
+// Its first cut, taken with one object column at the end of the query, was not
+// enough on its own: that column carried all three variable-length fields at
+// once *and* was last, so three effects could not be separated. The five
+// columns the query grew afterwards are what separated them; see
+// ociDescribeQuery.
 const oci64DescribeFixture = "testdata/oci64_describe.hex"
 
-// ociDescribeObjectType is the object type ociDescribeQuery's last column needs.
-const ociDescribeObjectType = `CREATE OR REPLACE TYPE dbbat_cap_obj AS OBJECT (a NUMBER, b VARCHAR2(10))`
+// ociDescribeObjectTypes are the object types ociDescribeQuery's object columns
+// need, and the three type **names** are the measurement: 13, 7 and 33
+// characters, so the three records that carry one differ in that field and in
+// nothing else. A single object type could only ever say "consistent with".
+var ociDescribeObjectTypes = []string{
+	`CREATE OR REPLACE TYPE dbbat_cap_obj AS OBJECT (a NUMBER, b VARCHAR2(10))`,
+	`CREATE OR REPLACE TYPE dbbat_o AS OBJECT (a NUMBER)`,
+	`CREATE OR REPLACE TYPE dbbat_cap_object_with_a_long_name AS OBJECT (a NUMBER)`,
+}
+
+// ociDescribeObjectTypeNames is the same list as the names to drop afterwards,
+// in the same order.
+var ociDescribeObjectTypeNames = []string{
+	"dbbat_cap_obj",
+	"dbbat_o",
+	"dbbat_cap_object_with_a_long_name",
+}
+
+// ociDescribeObjectTypeScript is ociDescribeObjectTypes as sqlplus statements,
+// for the capture route that has no side channel to the database.
+func ociDescribeObjectTypeScript() string {
+	script := ""
+	for _, ddl := range ociDescribeObjectTypes {
+		script += ddl + ";\n/\n"
+	}
+
+	return script
+}
+
+// ociDescribeObjectDropScript is the matching teardown.
+func ociDescribeObjectDropScript() string {
+	script := ""
+	for _, name := range ociDescribeObjectTypeNames {
+		script += "DROP TYPE " + name + ";\n"
+	}
+
+	return script
+}
 
 // writeDescribeHexFixture keeps every server payload that leads with a describe
 // message, as one hex line each.
@@ -414,6 +493,164 @@ func writeDescribeHexFixture(t *testing.T, dumpPath, outPath string) {
 	require.NoError(t, os.WriteFile(outPath, []byte(body), 0o600))
 
 	t.Logf("%d describe responses written to %s", frames, outPath)
+}
+
+// oci64LOBFixture is the evidence behind the LOB row walk: an sqlplus session
+// whose select list carries LOBs, recorded through dbbat. It holds the query's
+// describe (TTC 0x10) and — the frame the whole fixture exists for — the
+// **separate** packet its rows arrive in (TTC 0x06).
+//
+// It is a fixture of its own rather than five more columns on ociDescribeQuery
+// because a LOB in the select list changes the *shape of the round trip*, not
+// just the column records: Oracle turns row prefetch off, so the describe comes
+// back with no rows at all and the fetch follows in a packet that opens with a
+// ROW_HEADER. Folding the two together would have left one frame standing for
+// both, and neither readable.
+const oci64LOBFixture = "testdata/oci64_lob.hex"
+
+// ociLOBFixture is the same recording from a 4-byte-dialect client. Which of
+// the two a run writes is decided by the recorded frames (recordedDialectIsWide64),
+// never by which client was asked for.
+const ociLOBFixture = "testdata/oci_lob.hex"
+
+// ociLongFixture and oci64LongFixture are the same pair for a select list
+// carrying a **genuine** LONG and LONG RAW column — one the describe reports as
+// type 8 or 24 rather than a LOB a client re-declared. Written by
+// TestCapture_OCILongFetchThroughDBBat, and which one a run writes is decided
+// the same way.
+const (
+	ociLongFixture   = "testdata/oci_long.hex"
+	oci64LongFixture = "testdata/oci64_long.hex"
+)
+
+// ociLOBQuery is a select list that alternates LOBs with ordinary columns, and
+// the alternation is the measurement rather than a flourish: each six-character
+// string says exactly where the value after the locator beside it begins, so the
+// framing between them can be counted instead of guessed.
+//
+// The five LOBs are chosen to separate what a single one conflates. `d1` and
+// `d2` are CLOBs of 4 and 26 characters — the same framing at two content
+// lengths, which is what says the block is framing and not content. `d3` is a
+// BLOB and `d4` an NCLOB, so the reading covers the family rather than the one
+// type that produced it. `d5` is a NULL CLOB, which sends a zero-length locator
+// and a shorter block, and it is the case a fixed skip would get wrong. `x1` is
+// an XMLTYPE: an opaque type, whose locator is followed by the object's own
+// image instead, and the reason the walk reads that image's header rather than
+// hard-coding its distance.
+//
+// `c7` is last and ordinary on purpose. Before this, a LOB anywhere in a select
+// list cost the *whole* row, so a query that ends in an ordinary column is
+// exactly the shape that has to come back.
+const ociLOBQuery = `SELECT 'aaaaaa' AS c1,
+       TO_CLOB('body') AS d1,
+       'bbbbbb' AS c2,
+       TO_CLOB('muchlongervalue-0123456789') AS d2,
+       'cccccc' AS c3,
+       TO_BLOB(UTL_RAW.CAST_TO_RAW('7a7a')) AS d3,
+       'dddddd' AS c4,
+       TO_NCLOB('nn') AS d4,
+       'eeeeee' AS c5,
+       XMLTYPE('<a/>') AS x1,
+       'ffffff' AS c6,
+       TO_CLOB(NULL) AS d5,
+       'gggggg' AS c7
+  FROM dual;`
+
+// writeLOBFetchHexFixture keeps every server payload of a recording that leads
+// with a describe (TTC 0x10) or with a ROW_HEADER (TTC 0x06), as one hex line
+// each.
+//
+// Both message types are kept because the pair is the point: on a select list
+// with a LOB in it the describe carries no rows and the ROW_HEADER packet
+// carries all of them, and a fixture holding only one of the two could not show
+// that. The selection is by the message's own leading byte, never by decoding
+// the frame.
+func writeLOBFetchHexFixture(t *testing.T, dumpPath, outPath string) {
+	t.Helper()
+
+	writeFetchHexFixture(t, dumpPath, outPath,
+		"# An sqlplus session through dbbat against Oracle 23ai Free whose select\n"+
+			"# list carries LOBs (see ociLOBQuery): every server payload that leads with\n"+
+			"# a describe (TTC 0x10) or a ROW_HEADER (TTC 0x06), as the TNS Data payload\n"+
+			"# with its two data-flag bytes first — exactly as extractTTCPayload gets it.\n"+
+			"#\n"+
+			"# The last two frames are the pair the fixture exists for: a describe that\n"+
+			"# carries no row values at all, because Oracle turns row prefetch off when a\n"+
+			"# LOB is in the select list, and the packet the whole fetch then arrives in.\n",
+		"TestCapture_OCILOBFetchThroughDBBat")
+}
+
+// writeLongFetchHexFixture is writeLOBFetchHexFixture for the LONG columns —
+// the same selection over a session whose select list carries a column the
+// describe itself reports as LONG (8) or LONG RAW (24).
+func writeLongFetchHexFixture(t *testing.T, dumpPath, outPath string) {
+	t.Helper()
+
+	writeFetchHexFixture(t, dumpPath, outPath,
+		"# An sqlplus session through dbbat against Oracle 23ai Free whose select\n"+
+			"# list carries a genuine LONG and a genuine LONG RAW column (see\n"+
+			"# ociLongQuery): every server payload that leads with a describe (TTC 0x10)\n"+
+			"# or a ROW_HEADER (TTC 0x06), as the TNS Data payload with its two data-flag\n"+
+			"# bytes first — exactly as extractTTCPayload gets it.\n"+
+			"#\n"+
+			"# It exists to answer one question the thin recordings could not: whether\n"+
+			"# the indicator-and-return-code trailer a LONG column carries there is the\n"+
+			"# thin dialect's spelling or the protocol's. See readInlineLongColumn.\n",
+		"TestCapture_OCILongFetchThroughDBBat")
+}
+
+// writeFetchHexFixture is the body both of those share: every server payload
+// leading with 0x10 or 0x06, one hex line each, behind the given header and a
+// regeneration line naming the test that produced it.
+func writeFetchHexFixture(t *testing.T, dumpPath, outPath, header, testName string) {
+	t.Helper()
+
+	// Which client the run must be started with to reproduce *this* file. The
+	// two OCI dialects are two bodies of evidence here — their LOB headers
+	// differ by two bytes — so a header naming the wrong one would send the
+	// next person to re-record the other dialect over it.
+	client := "ORACLE_TEST_OCI_CLIENT=path"
+	if recordedDialectIsWide64(t, dumpPath) {
+		client = "ORACLE_TEST_OCI_CLIENT=container"
+	}
+
+	body := header +
+		"#\n" +
+		"# Regenerate with:\n" +
+		"#   ORACLE_CAPTURE_OCI_FIXTURES=1 " + client + " \\\n" +
+		"#     go test -tags integration -run " + testName + " ./internal/proxy/oracle/\n"
+
+	describes, fetches := 0, 0
+
+	eachRecordedTNSPayload(t, dumpPath, func(clientToServer bool, payload []byte) {
+		if clientToServer {
+			return
+		}
+
+		ttc := extractTTCPayload(payload)
+		if len(ttc) == 0 {
+			return
+		}
+
+		switch ttc[0] {
+		case byte(TTCFuncQueryResult):
+			describes++
+		case byte(TTCFuncContinuation):
+			fetches++
+		default:
+			return
+		}
+
+		body += hex.EncodeToString(payload) + "\n"
+	})
+
+	require.Positive(t, describes, "the sqlplus session must have described at least one query")
+	require.Positive(t, fetches,
+		"the query's rows must have arrived in a ROW_HEADER packet of their own — "+
+			"without one there is nothing here to pin")
+	require.NoError(t, os.WriteFile(outPath, []byte(body), 0o600))
+
+	t.Logf("%d describes and %d row packets written to %s", describes, fetches, outPath)
 }
 
 // writeStatementFrameHexFixture keeps every client frame of a recording whose

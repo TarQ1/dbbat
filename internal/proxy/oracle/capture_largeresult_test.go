@@ -41,6 +41,20 @@ func largeResultPayload(n int) string {
 func replayCapturedRows(t *testing.T, td *testDump, sqlMarker string) [][]string {
 	t.Helper()
 
+	return replayCapturedRowsUnder(t, td, sqlMarker, nil)
+}
+
+// replayCapturedRowsUnder is replayCapturedRows with the LOB reading imposed
+// rather than read off the client's frames.
+//
+// It exists for one assertion and it is the gate every reading in this package
+// carries: a fetch offered both shapes is a fetch with two chances to produce a
+// plausible-looking row, so each thin recording is replayed under the *other*
+// client's reading and must come back with nothing. See
+// TestThinLOBFetchIsNotOfferedTheOtherReading.
+func replayCapturedRowsUnder(t *testing.T, td *testDump, sqlMarker string, forced *lobRowShape) [][]string {
+	t.Helper()
+
 	var (
 		started  bool
 		done     bool
@@ -48,11 +62,26 @@ func replayCapturedRows(t *testing.T, td *testDump, sqlMarker string) [][]string
 		colTypes []int
 		lastRow  []string
 		rows     [][]string
+		lobShape lobRowShape
+		oer      oerShape
 	)
+
+	if forced != nil {
+		lobShape = *forced
+	}
 
 	for _, pkt := range td.Packets {
 		if done {
 			break
+		}
+
+		// session.observeBigClrChunks's half of the pre-auth relay, and the
+		// reason it is read off the recording rather than assumed: the CLR long
+		// form a LONG column's value arrives in is the session's own
+		// negotiation, stated once in the Set Protocol reply. See
+		// readInlineLongColumn.
+		if pkt.Direction == dump.DirServerToClient && observeBigClrChunksFlag(pkt.Data) {
+			oer.bigClrChunks = true
 		}
 
 		tns, err := parseTNSFromDumpPacket(pkt.Data)
@@ -74,6 +103,16 @@ func replayCapturedRows(t *testing.T, td *testDump, sqlMarker string) [][]string
 				done = true // a new statement begins → the result set is over
 			}
 
+			// session.learnLOBRowShape's half of the client leg: a define block
+			// is the only place the LOB reading of the rows about to arrive is
+			// stated, and a replay that skipped it would read the fixtures
+			// under a shape their client never asked for.
+			if forced == nil && started && len(colTypes) > 0 {
+				if shape, ok := execDefineLOBShape(ttcPayload, colTypes); ok {
+					lobShape = shape
+				}
+			}
+
 			continue
 		}
 
@@ -83,7 +122,7 @@ func replayCapturedRows(t *testing.T, td *testDump, sqlMarker string) [][]string
 
 		switch funcCode { //nolint:exhaustive // only row-bearing response codes matter here
 		case TTCFuncQueryResult:
-			result := decodeQueryResultV2(ttcPayload, false)
+			result := decodeQueryResultV2(ttcPayload, oer, lobShape)
 			if result == nil {
 				continue
 			}
@@ -98,7 +137,7 @@ func replayCapturedRows(t *testing.T, td *testDump, sqlMarker string) [][]string
 				lastRow = row
 			}
 		case TTCFuncContinuation:
-			contRows := parseContinuationRows(ttcPayload, len(columns), lastRow, colTypes)
+			contRows := parseContinuationRows(ttcPayload, len(columns), lastRow, colTypes, oer, lobShape)
 			for _, row := range contRows {
 				strRow := make([]string, len(row))
 				for i, v := range row {

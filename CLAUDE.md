@@ -82,6 +82,7 @@ dbbat/
 │   ├── approval/            # Registry of queries parked awaiting a human
 │   ├── mcp/                 # MCP server for AI agents; executes SQL by dialing our own proxy listeners (see docs/mcp.md)
 │   ├── dump/                # Session packet dump format (read/write/anonymise)
+│   │   └── decode/          # `dbbat dump decode`: a capture as one line per protocol message, redacted by default (PostgreSQL only so far)
 │   ├── api/                 # REST API handlers and middleware
 │   │   └── openapi.yml      # OpenAPI 3.0 specification
 │   ├── proxy/
@@ -174,6 +175,7 @@ This applies even when the current task is otherwise complete — capture the fo
 ./dbbat db rollback                # Rollback last migration group
 ./dbbat db status                  # Show migration status
 ./dbbat dump anonymise <in> [out]  # Strip session metadata from a .pcapng capture
+./dbbat dump decode <in> [--rows]  # Print a capture as one line per protocol message (PostgreSQL only so far; values redacted unless --rows)
 ./dbbat audit verify               # Walk the audit_log HMAC chain; non-zero exit on a break
 ./dbbat audit verify --queries [--connection <uid>]  # Same for the per-connection query chains
 ./dbbat audit verify --rows [--connection <uid>]     # Same for the per-query captured result row chains
@@ -199,8 +201,8 @@ This applies even when the current task is otherwise complete — capture the fo
 | `DBB_DUMP_MAX_SIZE` | Max dump file size per session in bytes (default: 10MB) | No |
 | `DBB_DUMP_RETENTION` | Auto-delete dumps older than this (default: `24h`). Applies to the **local spool only** — dbbat never expires objects it uploaded | No |
 | `DBB_DUMP_UPLOAD_URL` | Blob bucket finished captures are uploaded to on session close, e.g. `s3://bucket/prefix` (also `file://`, `gs://`, `azblob://` via `gocloud.dev/blob`). Empty = local disk only, the default. Requires `DBB_DUMP_DIR`, which becomes the spool: captures are always written locally and uploaded once complete, never streamed live. Object key `<prefix>/YYYY/MM/DD/<instance-id>/<connection-uid>.pcapng`, recorded on the connection row so downloads never LIST the bucket. Remote retention is the bucket lifecycle policy. See `docs/dump-format.md` | No |
-| `DBB_QUERY_TAGGING` | Prepend a [sqlcommenter](https://google.github.io/sqlcommenter/)-style comment — `/*dbbat='<version>',user='<user>',conn='<12hex>',grant='<definition-slug>'*/` — to every statement forwarded to the target, so the *target's* own tooling (RDS Performance Insights, `pg_stat_statements`, the slow log) can attribute it to a dbbat user/connection/grant rather than to the one shared role every session logs in as. **Off by default**: it changes the bytes the database receives. **PostgreSQL, MySQL/MariaDB and MongoDB** — on MongoDB there is no statement text to comment, so the same `dbbat='…',user='…',conn='…',grant='…'` string rides in the command's `comment` field (`find`, `aggregate`, `getMore`, `insert`, `update`, `delete`, … — an allowlist), where `system.profile`, the Atlas profiler and `db.currentOp()` echo it back; a **client-supplied `comment` wins** and that command is forwarded untouched, since the field is single-valued and a driver's own tracing may own it. Oracle has its own switch, `DBB_QUERY_TAGGING_ORACLE` (below), and this one deliberately does not reach it. SQL Server is a follow-up. Prepended rather than appended, because `pg_stat_activity.query` and the slow log truncate at the *end*. It carries no timestamp and no per-statement id, so repeated executions stay byte-identical and the digest keeps aggregating them. `conn=` is the same 12 hex characters as the app-name `c=` tag. Applied on the wire **only**: PG `Query` and `Parse` (once — every `Execute` inherits it), MySQL `COM_QUERY` and `COM_STMT_PREPARE` (`COM_STMT_EXECUTE` is binary and untouched), MongoDB the forwarded `OP_MSG` body. Every grant control, every bypass scan and every approval pattern runs on the **client's** text beforehand, and the `queries` table, the audit chain, the UI's text search and the `.pcapng` captures all store the client's text — the tag is reconstructible from the connection row, so it is never persisted. See `docs/postgresql.md`, `docs/mysql.md` and `docs/mongodb.md` | No |
-| `DBB_QUERY_TAGGING_ORACLE` | Oracle's own statement tag: `off` (default) or `user`. Separate from `DBB_QUERY_TAGGING` because the trade-off is Oracle's alone — `V$SQL` keys on statement text, so every distinct tag is a distinct SQL_ID holding its own shared-pool cursor. Measured on 23ai (600 executions of one join): a per-*connection* tag costs 200 cursors and 9.6MB for 200 sessions and has no ceiling; dropping `conn=` bounds it at one cursor per dbbat **user**, ~48KB and one hard parse each, then a flat plateau (a second 600 executions added zero loads and zero bytes). Hence `user` as the only non-off value, and `shared.NewUserQueryTagger`'s conn-less bytes. Anything else is a **startup failure**. Unlike the other three protocols, the Oracle proxy relays the client's own TNS packets, so turning this on does not oblige it to tag: `internal/proxy/oracle/ttc_statement_rewrite.go` rewrites a frame only when it can relocate the statement **to the byte** — the SQL-length field's offset, width and encoding (compressed int on the `03 5e`/`11 69` execs, `sqlLen*3` ub4 for OCI, `decodeVarLen` on OALL8), the value's span and its CLR framing (short, bare, or `0xFE`-chunked) — *and* re-encoding what it read reproduces the client's own bytes. Injected in `clientToUpstream` between the `blocked` check and the write loop, so the controls, the `queries` row, the audit chain and the capture have all already run on the client's text. **The decision is per session and taken once**: a client shape the locator cannot certify runs untagged start to finish and logs why, because a statement tagged on some executions and not others would get two SQL_IDs and double the cursor count the design exists to bound. 186/186 recorded frames in `testdata/` locate and round-trip; see `docs/oracle.md` | No |
+| `DBB_QUERY_TAGGING` | Prepend a [sqlcommenter](https://google.github.io/sqlcommenter/)-style comment — `/*dbbat='<version>',user='<user>',conn='<12hex>',grant='<definition-slug>'*/` — to every statement forwarded to the target, so the *target's* own tooling (RDS Performance Insights, `pg_stat_statements`, the slow log) can attribute it to a dbbat user/connection/grant rather than to the one shared role every session logs in as. **Off by default**: it changes the bytes the database receives. It is the **deployment default**, not the switch: the `tagging.enabled` store parameter wins over it when set — in both directions, a stored `false` overriding a `DBB_QUERY_TAGGING=true` — and that is the layer the Settings page and `PUT /instance/tagging` edit, without a redeploy. Resolved **per session, at authentication** (`shared.QueryTaggingResolver`, over the same cached read as the statement timeout), so a live session keeps the decision it authenticated under; terminate it to make it reconnect under the new one. **PostgreSQL, MySQL/MariaDB and MongoDB** — on MongoDB there is no statement text to comment, so the same `dbbat='…',user='…',conn='…',grant='…'` string rides in the command's `comment` field (`find`, `aggregate`, `getMore`, `insert`, `update`, `delete`, … — an allowlist), where `system.profile`, the Atlas profiler and `db.currentOp()` echo it back; a **client-supplied `comment` wins** and that command is forwarded untouched, since the field is single-valued and a driver's own tracing may own it. Oracle has its own switch, `DBB_QUERY_TAGGING_ORACLE` (below), and this one deliberately does not reach it. SQL Server is a follow-up. Prepended rather than appended, because `pg_stat_activity.query` and the slow log truncate at the *end*. It carries no timestamp and no per-statement id, so repeated executions stay byte-identical and the digest keeps aggregating them. `conn=` is the same 12 hex characters as the app-name `c=` tag. Applied on the wire **only**: PG `Query` and `Parse` (once — every `Execute` inherits it), MySQL `COM_QUERY` and `COM_STMT_PREPARE` (`COM_STMT_EXECUTE` is binary and untouched), MongoDB the forwarded `OP_MSG` body. Every grant control, every bypass scan and every approval pattern runs on the **client's** text beforehand, and the `queries` table, the audit chain, the UI's text search and the `.pcapng` captures all store the client's text — the tag is reconstructible from the connection row, so it is never persisted. See `docs/postgresql.md`, `docs/mysql.md` and `docs/mongodb.md` | No |
+| `DBB_QUERY_TAGGING_ORACLE` | Oracle's own statement tag: `off` (default) or `user`. The deployment default for the `tagging.oracle` store parameter, which wins over it when set (Settings page / `PUT /instance/tagging`); an unrecognized value is a startup failure **here** but a `400` there, and one that reaches the store anyway folds to `off` with a WARN rather than failing every replica's next restart. Separate from `DBB_QUERY_TAGGING` because the trade-off is Oracle's alone — `V$SQL` keys on statement text, so every distinct tag is a distinct SQL_ID holding its own shared-pool cursor. Measured on 23ai (600 executions of one join): a per-*connection* tag costs 200 cursors and 9.6MB for 200 sessions and has no ceiling; dropping `conn=` bounds it at one cursor per dbbat **user**, ~48KB and one hard parse each, then a flat plateau (a second 600 executions added zero loads and zero bytes). Hence `user` as the only non-off value, and `shared.NewUserQueryTagger`'s conn-less bytes. Anything else is a **startup failure**. Unlike the other three protocols, the Oracle proxy relays the client's own TNS packets, so turning this on does not oblige it to tag: `internal/proxy/oracle/ttc_statement_rewrite.go` rewrites a frame only when it can relocate the statement **to the byte** — the SQL-length field's offset, width and encoding (compressed int on the `03 5e`/`11 69` execs, `sqlLen*3` ub4 for the 4-byte OCI dialect, a plain-byte-count ub8 for the 64-bit one, `decodeVarLen` on OALL8), the value's span and its CLR framing (short, bare, or `0xFE`-chunked) — *and* re-encoding what it read reproduces the client's own bytes. Injected in `clientToUpstream` between the `blocked` check and the write loop, so the controls, the `queries` row, the audit chain and the capture have all already run on the client's text. **The decision is per session and taken once**: a client shape the locator cannot certify runs untagged start to finish and logs why, because a statement tagged on some executions and not others would get two SQL_IDs and double the cursor count the design exists to bound. 186/186 recorded frames in `testdata/*.pcapng` locate and round-trip, plus the three 64-bit OCI parses in `testdata/oci64_parse_execs.hex` that no pcapng recording can carry; see `docs/oracle.md` | No |
 | `DBB_QUERY_STORAGE_RETENTION` | Auto-delete query history (and captured result rows) older than this Go duration. Default `0` = keep forever; `720h` (30 days) is a reasonable opt-in value. The **statement** window, and the one `store.Options.QueryRetention` is fed from | No |
 | `DBB_CONNECTION_RETENTION` | Auto-delete **closed** connections — the session ledger (who, from where, to which database, under which grant) — once `disconnected_at` is older than this Go duration, cascading to whatever queries and rows they still have. **Unset = inherit the query window**, so an upgrade sweeps exactly what it swept before; explicit `0` keeps the ledger forever while statements still expire, which is the point of the split. It must be **≥** the query window: a shorter one would delete statements sooner than configured, so it — like a value shorter than the query window, a malformed value on either side, or a non-zero value with queries kept forever — **disables both sweeps** with a startup WARN naming both values, never a startup failure. All four rules live in `config.Config.RetentionWindows()`. Note the object key of an uploaded capture lives on the connection row, so a ledger window shorter than the bucket lifecycle orphans those objects | No |
 | `DBB_MYSQL_TLS_DISABLE` | Refuse TLS upgrade on the MySQL listener (default: `false`) | No |
@@ -426,6 +428,23 @@ The same auth + grant + query-logging pipeline runs across all five protocols (`
   **Deactivating** a definition is different from that archival — it withdraws
   the whole lineage and fails closed at auth time; hard deletion is refused
   (409) while anything references it.
+- **A server row is editable; its protocol is not.** `PUT /servers/{uid}`
+  takes host, port, database/service name, credentials, `ssl_mode`, `listable`,
+  the tunnel and the name, and the admin UI's edit dialog offers all of them
+  (the name in its own dialog, for its own warning). Editing does **not**
+  re-issue anything: every grant already covering the row reaches the new
+  target on the next connect, sessions already open stay on the upstream they
+  dialed, and `GET /servers/{uid}/references` is what the dialog counts that
+  with — live grants (anchored **or** group-bound, under the auth path's own
+  liveness predicate) and the server groups carrying the row. Same trade as
+  live server-group membership, same answer: warn at the point of edit rather
+  than make the row immutable. `protocol` is the exception, refused **409**
+  once any grant or connection references the row — it is the one edit that
+  makes the row a *different server*, and the history under its uid would
+  silently re-label itself. A pristine row may still change protocol, so a
+  create-dialog typo stays a one-click fix. `redactUpdateForAudit` replaces the
+  secrets with "changed" markers and the UI sends only the fields that actually
+  moved, so `database.updated` reads as the edit that was made.
 
 ### Per-statement time limits
 
@@ -470,7 +489,16 @@ that passes `limit + StatementTimeoutGrace` (2s, a constant, not a setting). The
 250ms poll means the kill lands within 2.25s of the limit. **Time parked on an
 approval hold does not count**: the clock starts when the statement is actually
 sent upstream, which a held statement has not been — and the server-side
-settings agree by construction, having never seen it.
+settings agree by construction, having never seen it. The clock is kept honest
+at every protocol boundary: PostgreSQL's extended protocol pops the pending
+queue on **all four** `Execute` terminators (`CommandComplete`, `ErrorResponse`,
+`EmptyQueryResponse`, `PortalSuspended` — a suspended portal is idle, not
+executing) and, as a backstop, finishes at each `ReadyForQuery` any pending
+entry whose batch the protocol has already closed (one RFQ answers one
+forwarded `Sync`/simple `Query`, and the entry stamps the count it was queued
+under), logging it as `no completion message from upstream`; on a termination,
+the limit text lands on the **oldest** in-flight entry — the statement the
+clock measured — and the others complete as aborted.
 
 On a trip, in this order: **cancel upstream, then close both sockets**. Closing
 alone is not enough — a PostgreSQL backend in a long sequential scan does not
@@ -610,8 +638,15 @@ sentinel, which is what keeps the two apart.
   `connection.closed` from whichever writer closes it (`CloseConnection` or the
   reconcile, recorded as `closed_by`) — carrying the row's **immutable**
   identity (connection uid, user, database, source IP, `connected_at`,
-  instance/run, grant) plus, on close, `disconnected_at` and the session's
-  sealed `query_chain_mac`. The mutable counters stay out. That is what makes
+  instance/run, grant) plus, on open, the target it actually reached —
+  `target_host`, `target_port`, `target_database` (the SERVICE_NAME on Oracle),
+  read from the `servers` row in `recordConnectionOpened` so no proxy call site
+  can forget it — and, on close, `disconnected_at` and the session's sealed
+  `query_chain_mac`. The target is there because `database_id` names an
+  **editable** row: without it the ledger would stop saying where a past
+  session went the moment an admin corrected a host, which is precisely the
+  property the old UI-level immutability was standing in for. It is immutable
+  for the *session*, never for the row. The mutable counters stay out. That is what makes
   `DELETE FROM connections` (which cascades to `queries` and `query_rows`) leave
   evidence — but only **by comparison**: no walk reports it, and every column of
   a connection row, `connected_at` included, is still unsealed. The write is

@@ -25,7 +25,7 @@ import (
 //
 // So `locateStatementRewrite` answers only when it can name, to the byte:
 //
-//   - the SQL-length field's offset, its encoded width and which of the three
+//   - the SQL-length field's offset, its encoded width and which of the four
 //     encodings it uses;
 //   - the span holding the statement value, with whatever CLR framing wraps it;
 //   - the statement bytes themselves.
@@ -36,7 +36,7 @@ import (
 // change it. It runs on every frame, not just on the first, and costs one
 // comparison of a few hundred bytes.
 //
-// Three shapes are covered, all of them measured against the recordings in
+// Four shapes are covered, all of them measured against the recordings in
 // testdata/ (see ttc_statement_rewrite_survey_test.go):
 //
 //   - **thin exec** (`03 5e`, and the same op stapled behind a `11 69` close
@@ -46,15 +46,23 @@ import (
 //     before the text; ojdbc and DBeaver write the run bare, with the header
 //     field as its only length. Both are handled, and told apart by what is
 //     actually in front of the run.
-//   - **OCI wide exec** (sqlplus, SQL*Developer, Instant Client): the length is
-//     a little-endian ub4 holding `sqlLen * 3` behind the `fe x8` pointer
-//     sentinel, and the CLR body carries the trailing NUL the client counts.
-//     The NUL rides along at the end of the run and needs no special case: the
-//     rewriter prepends to the *value*, not to the text. It covers the
-//     anonymous PL/SQL block with a bind that sqlplus staples behind a
-//     close-cursors piggyback too — a shape once thought to be outside this
+//   - **OCI wide exec, 4-byte dialect** (sqlplus, SQL*Developer, Instant
+//     Client): the length is a little-endian ub4 holding `sqlLen * 3` behind the
+//     `fe x8` pointer sentinel, and the CLR body carries the trailing NUL the
+//     client counts. The NUL rides along at the end of the run and needs no
+//     special case: the rewriter prepends to the *value*, not to the text. It
+//     covers the anonymous PL/SQL block with a bind that sqlplus staples behind
+//     a close-cursors piggyback too — a shape once thought to be outside this
 //     list, and measured not to be (testdata/sqlplus_refcursor.pcapng, and
 //     "A shape that was thought to be outside that count" in docs/oracle.md).
+//   - **OCI wide exec, 64-bit dialect** (the sqlplus bundled in the Oracle
+//     image, which is the client CI runs): the same field list at this
+//     dialect's widths, so the length sits at offset 33 rather than 21 — and it
+//     is a ub8 holding the **plain byte count**, not `sqlLen * 3`. Which of the
+//     two OCI readings applies comes from the session's learned dialect
+//     (`clientWide64Encoding`), never from sniffing the frame. No pcapng
+//     recording carries this client, so its measurement is
+//     testdata/oci64_parse_execs.hex — see the survey.
 //   - **OALL8** (`0x0e`, legacy pre-v315): `decodeVarLen` (1 byte / `0xFE`+2BE /
 //     `0xFF`+4BE) with the text immediately behind it and the bind count
 //     immediately behind that. No recording carries one, so it is covered by
@@ -67,7 +75,7 @@ import (
 // with the client's own observed chunk size and chunk-length encoding, which is
 // what the round-trip check pins.
 
-// stmtLenKind names the three encodings a statement-carrying TTC op uses for its
+// stmtLenKind names the four encodings a statement-carrying TTC op uses for its
 // SQL-length field.
 type stmtLenKind int
 
@@ -81,6 +89,12 @@ const (
 	// stmtLenVarLen is OALL8's decodeVarLen encoding. Its width changes with
 	// the value too.
 	stmtLenVarLen
+	// stmtLenWide64UB8 is the **64-bit** OCI header's length: a little-endian
+	// ub8 holding the **plain byte count**, not three times it. Fixed width,
+	// like the ub4 above. The two differ in more than width, which is why this
+	// is a kind of its own rather than the ub4 widened — see
+	// execSQLLengthWide64Field.
+	stmtLenWide64UB8
 )
 
 // stmtClrKind names how the statement value is framed inside the message.
@@ -194,6 +208,12 @@ func (r stmtRewrite) encodeLen(n int) []byte {
 	case stmtLenWideUB4:
 		out := make([]byte, 4)
 		binary.LittleEndian.PutUint32(out, uint32(n*wideCharWidth))
+
+		return out
+
+	case stmtLenWide64UB8:
+		out := make([]byte, execWide64SQLLenWidth)
+		binary.LittleEndian.PutUint64(out, uint64(n))
 
 		return out
 
@@ -339,15 +359,25 @@ func encodeChunkedCLR(data []byte, chunkSize int, bigChunks bool) []byte {
 //
 // bigChunks is the session's negotiated CLR long form; it only takes part in the
 // round-trip check, never in the search.
-func locateStatementRewrite(ttcPayload []byte, bigChunks bool) (stmtRewrite, bool) {
-	if rw, ok := locateExecRewriteAt(ttcPayload, 0, bigChunks); ok {
+//
+// wide64 says the session has learned its client writes the 64-bit OCI op header
+// (`session.clientWide64Encoding`, read off the client's own AUTH Phase 1). It
+// selects that dialect's header reading and **only** it, for the reason
+// execNoStatementCursor spells out: the three exec headers are each other's
+// near-misses, and offering one session's bytes a second layout to be mistaken
+// for is how a run of zeros becomes a length. An exec header is a client frame,
+// so the client-side flag is the right evidence — never a sniff of the bytes
+// being rewritten.
+func locateStatementRewrite(ttcPayload []byte, bigChunks, wide64 bool) (stmtRewrite, bool) {
+	if rw, ok := locateExecRewriteAt(ttcPayload, 0, bigChunks, wide64); ok {
 		return rw, true
 	}
 
 	// The JDBC/DBeaver shape: a close-cursors list with the execute stapled
-	// behind it, which is the same op at a non-zero offset.
+	// behind it, which is the same op at a non-zero offset. sqlplus staples the
+	// same way at both OCI dialects.
 	if end, ok := closeCursorsEnd(ttcPayload); ok && end < len(ttcPayload) {
-		if rw, ok := locateExecRewriteAt(ttcPayload, end, bigChunks); ok {
+		if rw, ok := locateExecRewriteAt(ttcPayload, end, bigChunks, wide64); ok {
 			return rw, true
 		}
 	}
@@ -390,14 +420,14 @@ const oall8RewriteEnabled = false
 
 // locateExecRewriteAt locates the statement of an exec op starting at base
 // inside ttcPayload, returning offsets relative to ttcPayload.
-func locateExecRewriteAt(ttcPayload []byte, base int, bigChunks bool) (stmtRewrite, bool) {
+func locateExecRewriteAt(ttcPayload []byte, base int, bigChunks, wide64 bool) (stmtRewrite, bool) {
 	body := ttcPayload[base:]
 
 	if !isPiggybackExecHeader(body) || len(body) < execHeaderMinLen {
 		return stmtRewrite{}, false
 	}
 
-	field, ok := execSQLLengthField(body)
+	field, ok := execSQLLengthFieldFor(body, wide64)
 	if !ok {
 		return stmtRewrite{}, false
 	}
@@ -578,10 +608,14 @@ func valuePrecededByAnotherLength(body []byte, valueAt, declared int) bool {
 	ub4 := make([]byte, 4)
 	binary.LittleEndian.PutUint32(ub4, uint32(declared*wideCharWidth))
 
+	ub8 := make([]byte, execWide64SQLLenWidth)
+	binary.LittleEndian.PutUint64(ub8, uint64(declared))
+
 	for _, enc := range [][]byte{
 		ttcCompressedUint(uint64(declared)),
 		encodeVarLenBytes(declared),
 		ub4,
+		ub8,
 	} {
 		if len(enc) < 2 || valueAt-len(enc) < 0 {
 			continue

@@ -94,7 +94,7 @@ func tagOf(n int) string {
 func rewriteWith(t *testing.T, body []byte, prefix string, bigChunks bool) []byte {
 	t.Helper()
 
-	rw, ok := locateStatementRewrite(body, bigChunks)
+	rw, ok := locateStatementRewrite(body, bigChunks, false)
 	require.True(t, ok, "the locator must answer for this frame")
 	require.Equal(t, body, rw.apply(body, rw.run, bigChunks),
 		"rewriting a statement to itself must reproduce the frame byte for byte")
@@ -110,19 +110,19 @@ func TestRewriteCompressedLengthKeepsItsWidth(t *testing.T) {
 	sql := "SELECT " + strings.Repeat("a", 90) + " FROM dual"
 	body := thinExecCLR(sql)
 
-	before, ok := execSQLLengthField(body)
+	before, ok := execSQLLengthFieldFor(body, false)
 	require.True(t, ok)
 	require.Equal(t, 2, before.width, "a length under 256 is a one-byte compressed int plus its count")
 
 	out := rewriteWith(t, body, tagOf(40), false)
 
-	after, ok := execSQLLengthField(out)
+	after, ok := execSQLLengthFieldFor(out, false)
 	require.True(t, ok)
 	assert.Equal(t, len(sql)+40, after.value)
 	assert.Equal(t, 2, after.width, "still under 256, so the field did not move")
 	assert.Len(t, out, len(body)+40, "only the tag was added")
 
-	stmt, ok := decodeExecStatementText(out)
+	stmt, ok := decodeExecStatementText(out, false)
 	require.True(t, ok)
 	assert.Equal(t, tagOf(40)+sql, stmt.Text)
 }
@@ -138,7 +138,7 @@ func TestRewriteCompressedLengthWidens(t *testing.T) {
 
 	body := thinExecBare(sql)
 
-	before, ok := execSQLLengthField(body)
+	before, ok := execSQLLengthFieldFor(body, false)
 	require.True(t, ok)
 	require.Equal(t, 2, before.width)
 
@@ -146,13 +146,13 @@ func TestRewriteCompressedLengthWidens(t *testing.T) {
 
 	out := rewriteWith(t, body, tagOf(tagLen), false)
 
-	after, ok := execSQLLengthField(out)
+	after, ok := execSQLLengthFieldFor(out, false)
 	require.True(t, ok)
 	require.Greater(t, after.value, 255)
 	assert.Equal(t, 3, after.width, "past 255 the compressed int needs a second value byte")
 	assert.Len(t, out, len(body)+tagLen+1, "the tag, plus the byte the length field grew by")
 
-	stmt, ok := decodeExecStatementText(out)
+	stmt, ok := decodeExecStatementText(out, false)
 	require.True(t, ok)
 	assert.Equal(t, tagOf(tagLen)+sql, stmt.Text)
 }
@@ -188,7 +188,7 @@ func TestRewriteWideUB4Length(t *testing.T) {
 			"the field carries three times the length, as the client writes it")
 		assert.Len(t, out, len(body)+40)
 
-		stmt, ok := decodeExecStatementText(out)
+		stmt, ok := decodeExecStatementText(out, false)
 		require.True(t, ok)
 		assert.Equal(t, tagOf(40)+sql, strings.TrimSuffix(stmt.Text, "\x00"))
 	}
@@ -224,7 +224,7 @@ func TestOALL8RewriteIsDisabled(t *testing.T) {
 	_, ok := locateOALL8Rewrite(body, false)
 	require.True(t, ok, "the encoder itself still works; it is the dispatcher that declines")
 
-	_, ok = locateStatementRewrite(body, false)
+	_, ok = locateStatementRewrite(body, false, false)
 	assert.False(t, ok,
 		"an OALL8 frame must not be rewritten: see oall8RewriteEnabled and "+
 			"specs/todos/2026-09-16-11-oracle-tag-oall8-rewrite.md")
@@ -288,14 +288,14 @@ func TestRewriteCLRCrossesTheChunkBoundary(t *testing.T) {
 		require.Greater(t, len(sql)+46, clrShortMaxLen,
 			"the point of the fixture is that the tagged value no longer fits the short form")
 
-		rw, ok := locateStatementRewrite(out, bigChunks)
+		rw, ok := locateStatementRewrite(out, bigChunks, false)
 		require.True(t, ok, "bigChunks=%v: the long form must be locatable too", bigChunks)
 		assert.Equal(t, stmtClrChunked, rw.clrKind, "bigChunks=%v", bigChunks)
 		assert.Equal(t, bigChunks, rw.chunkBig,
 			"the value is written in the variant the session negotiated")
 		assert.Equal(t, tagOf(46)+sql, rw.text())
 
-		stmt, ok := decodeExecStatementText(out)
+		stmt, ok := decodeExecStatementText(out, false)
 		require.True(t, ok, "bigChunks=%v", bigChunks)
 		assert.Equal(t, tagOf(46)+sql, stmt.Text)
 	}
@@ -312,7 +312,7 @@ func TestRewriteCLRStaysShortUnderTheLimit(t *testing.T) {
 
 	out := rewriteWith(t, body, tagOf(46), true)
 
-	rw, ok := locateStatementRewrite(out, true)
+	rw, ok := locateStatementRewrite(out, true, false)
 	require.True(t, ok)
 	assert.Equal(t, stmtClrShort, rw.clrKind)
 	assert.Equal(t, byte(len(sql)+46), out[rw.valueAt], "the prefix is the new length")
@@ -331,7 +331,7 @@ func TestRewriteChunkedOriginalKeepsTheClientsChunking(t *testing.T) {
 
 		body := thinExecFrame(sql, encodeChunkedCLR([]byte(sql), chunkSize, bigChunks))
 
-		rw, ok := locateStatementRewrite(body, bigChunks)
+		rw, ok := locateStatementRewrite(body, bigChunks, false)
 		require.True(t, ok, "bigChunks=%v", bigChunks)
 		require.Equal(t, stmtClrChunked, rw.clrKind)
 		assert.Equal(t, chunkSize, rw.chunkSize, "the client's chunk size, read off the wire")
@@ -340,7 +340,7 @@ func TestRewriteChunkedOriginalKeepsTheClientsChunking(t *testing.T) {
 
 		out := rewriteWith(t, body, tagOf(46), bigChunks)
 
-		back, ok := locateStatementRewrite(out, bigChunks)
+		back, ok := locateStatementRewrite(out, bigChunks, false)
 		require.True(t, ok)
 		assert.Equal(t, chunkSize, back.chunkSize, "still chunked at the client's size")
 		assert.Equal(t, tagOf(46)+sql, back.text())
@@ -363,7 +363,7 @@ func TestLocatorRefusesAnAmbiguousFrame(t *testing.T) {
 
 	body := thinExecFrame(sql, value)
 
-	_, ok := locateStatementRewrite(body, false)
+	_, ok := locateStatementRewrite(body, false, false)
 	assert.False(t, ok, "a frame carrying the statement twice must be refused, not guessed at")
 }
 
@@ -388,7 +388,7 @@ func TestRewriteRefusesToGrowAStatementPastWhatDbbatReads(t *testing.T) {
 	atLimit := head + strings.Repeat("a", maxTaggableStatementBytes-len(head)-len(tail)) + tail
 	require.Len(t, atLimit, maxTaggableStatementBytes)
 
-	rw, ok := locateStatementRewrite(thinExecBare(atLimit), false)
+	rw, ok := locateStatementRewrite(thinExecBare(atLimit), false, false)
 	require.True(t, ok,
 		"the frame is locatable: the refusal below is about how long it would become, not about its shape")
 	require.Equal(t, atLimit, rw.text())
@@ -403,7 +403,7 @@ func TestRewriteRefusesToGrowAStatementPastWhatDbbatReads(t *testing.T) {
 	justUnder := head + strings.Repeat("a", maxTaggableStatementBytes-len(head)-len(tail)-tag) + tail
 	require.Len(t, justUnder, maxTaggableStatementBytes-tag)
 
-	rw, ok = locateStatementRewrite(thinExecBare(justUnder), false)
+	rw, ok = locateStatementRewrite(thinExecBare(justUnder), false, false)
 	require.True(t, ok)
 	assert.True(t, rw.fitsTagged(tag), "the last statement under the bound must still be tagged")
 	assert.False(t, rw.fitsTagged(tag+1))
@@ -434,7 +434,7 @@ func TestLocatorRefusesAFrameItCannotReproduce(t *testing.T) {
 
 	body := thinExecCLR(sql)
 
-	_, ok := locateStatementRewrite(body, false)
+	_, ok := locateStatementRewrite(body, false, false)
 	assert.False(t, ok,
 		"a 0xFC short-form prefix is not something this package writes, so it is not something it rewrites")
 }
@@ -447,7 +447,7 @@ func TestLocatorRefusesANonStatementRun(t *testing.T) {
 	notSQL := "jdbc:oracle:thin:@//db.example.com:1521/FREEPDB1"
 	body := thinExecCLR(notSQL)
 
-	_, ok := locateStatementRewrite(body, false)
+	_, ok := locateStatementRewrite(body, false, false)
 	assert.False(t, ok, "a run that does not open with a SQL verb is not a statement")
 }
 
@@ -478,7 +478,7 @@ func TestRewriteSingleChunkLongFormIsNotReadAsABareRun(t *testing.T) {
 	} {
 		body := thinExecFrame(tc.sql, encodeChunkedCLR([]byte(tc.sql), len(tc.sql), tc.bigChunks))
 
-		rw, ok := locateStatementRewrite(body, tc.bigChunks)
+		rw, ok := locateStatementRewrite(body, tc.bigChunks, false)
 		require.True(t, ok, tc.name)
 		require.Equal(t, stmtClrChunked, rw.clrKind,
 			"%s: a single-chunk long form is still the long form", tc.name)
@@ -488,7 +488,7 @@ func TestRewriteSingleChunkLongFormIsNotReadAsABareRun(t *testing.T) {
 
 		out := rewriteWith(t, body, tagOf(52), tc.bigChunks)
 
-		back, ok := locateStatementRewrite(out, tc.bigChunks)
+		back, ok := locateStatementRewrite(out, tc.bigChunks, false)
 		require.True(t, ok, tc.name)
 		assert.Equal(t, tagOf(52)+tc.sql, back.text(),
 			"%s: the chunk header must declare the new length, not the old one", tc.name)
@@ -519,12 +519,12 @@ func TestLocatorRefusesASubLimitLongForm(t *testing.T) {
 
 	body := thinExecFrame(sql, value)
 
-	_, ok := locateStatementRewrite(body, false)
+	_, ok := locateStatementRewrite(body, false, false)
 	assert.False(t, ok,
 		"a long form below the short-form limit must be refused, not read as a short prefix")
 
 	// And the shape it must not be confused with still works: the same statement
 	// in the short form the same clients normally write.
-	_, ok = locateStatementRewrite(thinExecCLR(sql), false)
+	_, ok = locateStatementRewrite(thinExecCLR(sql), false, false)
 	assert.True(t, ok, "the ordinary short form must still be rewritable")
 }

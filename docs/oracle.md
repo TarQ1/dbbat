@@ -113,7 +113,9 @@ execute stapled behind the close list; the "python exec" sub-op (`0x11`/`0x98`)
 appears in **zero** frames across all 22 recordings in `testdata/`.
 
 **The execute declares its own statement length — read it, do not search for
-it** (`ttc_exec_statement.go`). Two header encodings carry it:
+it** (`ttc_exec_statement.go`). Three header encodings carry it, one per client
+dialect, and each is read only on the sessions that speak it
+(`execSQLLengthFieldFor`):
 
 ```
 thin (go-ora, python-oracledb thin, JDBC thin, DBeaver):
@@ -134,6 +136,16 @@ OCI wide (sqlplus, SQL*Developer via OCI, Instant Client):
   [21..24] sqlLen * 3   uint32 LE — the client sizes the buffer for its widest
                         character encoding, and counts a trailing NUL when it
                         writes one
+
+OCI 64-bit (the DB-bundled sqlplus 23.x — the dialect CI runs):
+  [0..2]   03 5e seq
+  [3..4]   00 00        where the 4-byte header puts [01][seq+1]
+  [5..8]   ub4          the last error number this session saw
+  [9..16]  sb8 = seq+1  the NEXT message's sequence number
+  [17..20] options      uint32 LE
+  [21..24] cursorID     uint32 LE
+  [25..32] fe x8        pointer sentinel
+  [33..40] sqlLen       uint64 LE — the **plain** byte count, not 3x it
 ```
 
 Verified byte-for-byte: go-ora's 56-byte `UPDATE dbbat_dml_test SET name =
@@ -289,6 +301,74 @@ requiring the chunks to concatenate to exactly `sqlLen` printable bytes behind
 a verb — and reports where the statement's wire bytes end, because bind capture
 cannot anchor a chunked statement by searching for its text
 (`execStatement.End`).
+
+#### The 64-bit exec header reaches the gate, not just the rewriter
+
+The third encoding above landed with the statement tag, and for a while only the
+*rewriter* used it. `decodeExecStatementText` and its callees took no dialect,
+so on a 64-bit OCI session the 4-byte walk refused the header (`body[3]` is
+`0x00`) and the thin walk read the low byte of that header's ub4 error number as
+a compressed-int size — so the decode declined and the frame fell through to the
+40–70 offset window and the keyword scan. The mechanism this section exists to
+replace was, on that whole client family, still the one in charge.
+
+`wide64` is now threaded `decodeExecStatement` → `decodeExecStatementText` →
+`decodeExecStatementAt` → `execSQLLength` → `execSQLLengthFieldFor`, which
+already had the parameter, and down `execFragmentShortfall` with it — the length
+reassembly owes is the length the decode reads, so a 64-bit session whose header
+the walk refused never reassembled an oversized statement in the first place.
+The dialect comes from the session (`session.clientWide64Encoding`, off the
+client's own AUTH Phase 1), never from trying one layout after another.
+
+**It was measured first, because the measurement could have said no**
+(`sql_extraction_survey_test.go`, the `TestSurveyWide64…` pair):
+
+- On the recorded bytes — `testdata/oci64_parse_execs.hex`, three parses of one
+  33-byte `BEGIN dbbat_cap_refcur(:rc); END;` — the window scan reads **every
+  frame whole**. That corpus alone says there is no gap, and it is asserted as
+  such so nobody re-derives the opposite from it.
+- Widened to the same recorded headers carrying ten statements — the rewriter
+  reproduces each frame byte for byte (`TestSurveyStatementRewriteWide64OCI`),
+  which is what makes it sound to stand in for the client on other text — the
+  gap appears at a boundary found by bisection rather than derived: **at or below
+  252 bytes the scan reads the statement whole; from 253 on it hands the gate
+  exactly 252 bytes**. On this dialect the statement's length prefix sits at a
+  fixed offset the window happens to cover, so the scan works precisely as long
+  as that prefix is one byte. 9 of 30 frames, and every one of them **silent** —
+  `Truncated` unset, because a window scan has no declared length to check its
+  run against. The header-anchored decode reads all 30 whole; before the dialect
+  was threaded down it read none of them at all.
+
+A silent prefix is not a cosmetic misreading: it is what `read_only`,
+`block_ddl`, the approval patterns and `ValidateOracleQuery` are evaluated
+against, and what the `queries` row stores. A `MERGE` whose write clause sits
+past byte 252 was gated on its first 252 bytes and recorded as them.
+
+**The live measurement found a second gap, and a worse one.** The survey's long
+statements are encoded by dbbat's **own** rewriter — sound for the header it
+reproduces byte for byte, but not a recorded client's CLR long form, and no
+fixture carries a 64-bit statement past 251 bytes. So
+`TestIntegration_OCILongStatementIsRecordedWhole` runs the statement from a real
+sqlplus and reads the `queries` row back, and it was sized by running it against
+a build deliberately told the wrong dialect:
+
+- a **322-byte** statement passes either way. This client writes it as one
+  contiguous run, so the keyword scan walks it end to end. The 253-byte boundary
+  is real for the long form dbbat's rewriter writes; sqlplus does not write that
+  form at that size;
+- a **40KB** one fails, for a reason the survey could not see. The message is
+  larger than the negotiated SDU, so `collectStatementMessage` asks
+  `execFragmentShortfall` how much more is owed — and that walk could not read
+  this dialect's header either, so the continuation packets were never
+  collected. Measured: **7877 bytes of 40610** recorded, cut at the fragment
+  boundary.
+
+That is the 2026-08-31 reassembly incident exactly (see `reassembly.go`), still
+live on this one client family: the gate enforced against the first packet's
+worth of statement, `/queries` recorded it, and everything past the fragment
+boundary — `oracleBlockedPatterns`, the approval patterns, the dynamic-SQL scan
+— was evadable by padding a statement past the SDU. It is why `execSQLLength`'s
+reassembly caller takes the dialect too, and not only the decode.
 
 ### `ALTER SESSION SET …` and the statement gate
 
@@ -916,35 +996,117 @@ cursor id and therefore gated no drive: the pre-feature behaviour on the
 visible side, the same ungated re-execution underneath.
 
 The drive half is the header reading above at this dialect's widths. The
-bind-output half could not be the walk above widened, and
-`internal/proxy/oracle/refcursor_bind_wide64.go` says why rather than papering
-over it. Recorded from one live session
-(`capture_oci_fixtures_integration_test.go`):
+bind-output half could not be the walk above widened. Recorded from one live
+session (`capture_oci_fixtures_integration_test.go`):
 
 - the IO vector's fixed header is **50 bytes** where the 4-byte dialect spends
   22, and its bind count sits at a different offset;
 - the descriptor header is the same field list at the same widths, plus one byte
-  before the first column record;
+  before the first column record — which turned out to be that record's own lead
+  byte rather than a header field, see below;
 - the descriptor's **trailing block is byte-for-byte identical** — the describe
   timestamp, four integers, an empty DLC, the cursor id;
-- but the per-column record in between is 25 bytes longer, and *where* those 25
-  bytes sit cannot be decided from the recordings in hand. Seven are ahead of
-  the type OID (the object column in `testdata/oci64_describe.hex` pins that),
-  eleven appear only when that OID is absent, and the last seven only when the
-  schema and type names are absent too — and the corpus holds exactly **one**
-  column with any of those three non-empty, so the three effects cannot be
-  separated. Widening the record walk would mean shipping offsets no recording
-  can falsify. Closing that — by recording the columns that separate them — is
-  `specs/todos/2026-09-21-01-oracle-wide64-column-record-layout.md`, and it is
-  also what would let `parseColumnDescribes` read this dialect at all.
+- and the per-column record in between is 25 bytes longer.
 
-So the column records are not parsed at all. The walk is header-driven at both
-ends and anchors the middle on the trailing block's own signature: a DLC of
-exactly seven bytes carrying an Oracle DATE, which is checked for being one.
-What makes that safe is what makes the 4-byte walk safe — everything after the
-anchor must decode and the block must **land** on the message that follows it,
-so a layout this gets wrong yields *no id*, which is the behaviour the dialect
-had before. It does not yield a different number.
+###### Where those 25 bytes sit
+
+For a while, nowhere that could be written down. The first recording's describe
+held exactly **one** column with a type OID, and it was also the only column
+with a schema name, the only one with a type name, and the **last** column of
+the query — so every byte the record spent differently on it was equally "the
+object column's", "the column with an OID's" and "the last column's". Any
+placement consistent with the seven scalar columns was consistent with that one
+too, and shipping a field walk would have meant shipping offsets no recording
+could falsify. Hence the walk that shipped first: header-driven at both ends,
+anchoring the middle on the trailing block's own signature — a DLC of exactly
+seven bytes carrying an Oracle DATE — and validating by landing.
+
+The recording that closed it (2026-09-22) added a **second** describe to the
+same session — `ociDescribeTypedQuery` — whose six columns separate those
+effects one by one: three object types at type-name lengths **13**, **7** and
+**33** and name lengths 3, 1 and 7; a `SYS.XMLTYPE`, the same shape again at a
+*schema* length of 3 against `SYSTEM`'s 6; a CLOB, which carries none of the
+three although its type is not scalar either; and an ordinary NUMBER placed
+**last**. It is a query of its own rather than five more columns on the first
+one because with a CLOB and an XMLTYPE in the select list the row capture of
+that fetch comes back empty — a separate defect, filed as
+`specs/todos/2026-09-22-03-oracle-row-capture-drops-every-row-of-a-fetch-carrying-a-lob.md`.
+
+The record then comes apart cleanly, and every width below is read off a column
+whose value for that field is non-zero — runs of zeros decide nothing and were
+not asked to:
+
+| | 4-byte dialect | 64-bit dialect | pinned by |
+|---|---|---|---|
+| lead flag | — | **1 byte, before every record** | see below |
+| type, flag, precision, scale | 4 | 4 | `NUMBER(10,2)`, and `1/3`'s 0x81 |
+| maxLen | 4 | 4 | 4000 on a `VARCHAR2(4000)`, 2000 on the object |
+| maxNoOfArrayElements + contFlag | 5 | **12** | the type OID's length, 12 bytes past maxLen on four object columns |
+| type OID | `[len ub4][CLR]` | same, **plus 11 bytes when absent** | see below |
+| version | 2 | **1** | the object columns, whose version is 1 |
+| charsetID | 2 | 2 | 873 |
+| charsetForm | 1 | **2** | 1, between charsetID and a maxCharLen of 4000 |
+| maxCharLen, oaccollid | 8 | 8 | 4000 and 16382 |
+| allowNull, v7 name length | 2 | 2 | |
+| name, schema, type name | 3 DLCs | 3 DLCs | `O`/`OBJ`/`OBJLONG`, `SYS`/`SYSTEM`, `XMLTYPE`/`DBBAT_CAP_OBJ`/… |
+| trailing block | 18 | **24** | measured whole: only its first byte is ever non-zero |
+
+The fixed part is then a constant **87** bytes with the three DLCs empty and
+**76** with them present, across every column of both describes — which is what
+turns "a layout consistent with one record" into a measurement.
+
+Two of those rows are worth their own sentence.
+
+**The lead flag** is the extra byte that was first measured *before the first
+record*, and it is not a header field. Read as a trailing flag, the eight
+records of the original fixture come out with two different tail lengths — 25
+bytes on the seven scalar columns, 23 on the object one — for no reason any
+field could supply. Read as a **lead** byte, every tail is 24 and the record
+differs only in its DLC payloads. Its value is set on every column without a
+type OID and clear on every column with one, in both describes; the `TAIL`
+column is what says this is not "another record follows", because it is last and
+carries the flag set, while `X` two columns earlier carries it clear. The walk
+keys on the OID's own length field rather than on this byte, because that field
+is a value it reads and validates a CLR against.
+
+**The eleven bytes an absent type OID costs** are the one part of this record
+that is not a field list. The distance from maxLen to `version` is 33 bytes on a
+column carrying a 16-byte OID and 27 on one carrying none, while the OID's CLR
+is 17 — so the absent case spends six more than removing the CLR accounts for,
+and the length field cannot simply move, because four object columns pin it
+twelve bytes past maxLen. No fixed layout fits both. What the corpus cannot say
+is *why*: the eleven bytes are zero wherever they appear, so "padding an absent
+DLC" and "an inline area a present OID displaces" are the same bytes, and
+`wide64TypeOID` says so instead of picking one. It is the field's own, not every
+empty DLC's — the descriptor's trailing empty DLC, in the same payload, costs
+four bytes and nothing else.
+
+So the column records are now **walked**, in both places that need them:
+`parseColumnDescribes` reads this dialect's describes (it used to be handed the
+4-byte layout — `describeWireLayout` keyed on `fixedWidth` alone — misalign on
+the first record and return nil, dropping every one of that session's row
+captures back to `scanAndPadColumnNames`), and the bind-output walk reaches the
+cursor id *through* the records rather than around them, which lets it use
+`isKnownTNSType` as the alignment proof the anchored version could not.
+`TestOCI64DescribeRecordsParse` holds the first to the bar
+`TestOCIDescribeRecordsParse` sets for the 4-byte dialect: every name and every
+type of **both** describes, against the same two expected column lists the
+4-byte dialect's test uses — two marshalings of the same two queries, so the
+reading that says they agree is the reading that says both walks are right.
+
+What has not changed is what happens when the walk is wrong: everything after
+the records must still decode and the block must still **land** on the message
+that follows it, so a layout this gets wrong yields *no id*, which is the
+behavior the dialect had before. It does not yield a different number.
+`TestOCI64DecoyTailSignatureIsWalkedStraightPast` keeps the old anchored reading
+alive in the test file for one job — proving that the decoy it plants is one
+that reading actually fell for.
+
+> A `SYS.XMLTYPE` column reports TTC type **58**, which `isKnownTNSType` did not
+> cover. That is a finding from this fixture and not a 64-bit one: under *all
+> three* encodings, a query with an XMLTYPE column anywhere in its select list
+> had its whole describe discarded and captured its rows under the scanner's
+> guesses. See `tnsTypeOPAQUE`.
 
 The cross-check is the same cross-check, and it is falsifiable because the ids
 differ: `TestDumpReplay_OCI64RefCursorIDsMatchTheCursorsTheClientDrives` pairs
@@ -1550,6 +1712,279 @@ continuation packets — is decoded by `parseRowStream` in `ttc_decode.go`.
 Verified against `testdata/go_ora_compressed.pcapng`
 (`TestDumpReplay_CompressedRows`): runs of a repeated column, NULLs, and the
 all-columns-change boundary.
+
+#### A LOB in the select list defers the whole fetch
+
+Oracle turns row prefetch **off** when the select list carries a LOB. The
+`func=0x10` QueryResult that answers the execute then has its column records and
+nothing behind them — no ROW_HEADER, no values — and every row of the fetch
+arrives in a **separate** server packet that *opens* with the ROW_HEADER object:
+
+```
+packet n     [func=0x10] [column records]                 ← no rows at all
+packet n+k   [ROW_HEADER 0x06 …] [0x07] [row values] …    ← the whole fetch
+```
+
+That second packet is a `func=0x06`, so it lands in `handleContinuation` — but it
+is not a continuation of a stream already running, and the 25-byte window that
+walk scans for its `0x07` cannot reach the start of the row data (the 64-bit
+ROW_HEADER alone is 50 bytes). `fetchRowDataStart` reads the header instead,
+under the session's own dialect and **only at offset 0**: a fetch response leads
+with the object or it is not one. Anywhere else the scan would be free to take a
+header-shaped run of bytes out of a real continuation packet's row data.
+
+Measured on `testdata/oci64_lob.hex`, which keeps both halves of that round trip
+(`ociLOBQuery`, `TestOCI64LOBDescribeCarriesNoRowValuesAtAll`). Until it was
+read, a query with a CLOB column anywhere in it captured **no rows at all** —
+not an unreadable value for that column, the whole row, every ordinary column
+beside it included, and nothing in the audit trail saying so.
+
+#### LOB, opaque, object and LONG columns do not send a length-prefixed datum
+
+Four type families do not:
+
+| Type | Codes | What the row carries |
+|---|---|---|
+| CLOB / NCLOB, BLOB, BFILE | 112, 113, 114 | a header and then a 40-byte locator — spelled differently in each dialect, see below |
+| Opaque (`SYS.XMLTYPE`) | 58 | a 36-byte locator, then framing, then the object's own image |
+| Named object type | 121 | the same |
+| LONG, LONG RAW | 8, 24 | the value itself, then the column's indicator and return code |
+
+Reading one of those as a scalar and carrying on is what used to lose the rest of
+the row. `readRowColumn` steps over the framing instead:
+
+- **LOB** — the framing started life as "16 bytes after a locator, 3 after a
+  NULL one", measured off the one recording there was
+  (`testdata/oci64_lob.hex`, the 64-bit OCI dialect). Recording the same query
+  on the other two says those sixteen were the sum of four fields, and that no
+  other dialect adds up to them:
+
+  | Dialect | What a LOB column carries | Recording |
+  |---|---|---|
+  | 64-bit OCI | `maxSize` ub4 LE · `size` ub8 LE · `chunkSize` ub4 LE · locator CLR | `testdata/oci64_lob.hex` |
+  | 4-byte OCI | `maxSize` ub4 LE · `size` **compressed** · `chunkSize` ub4 LE · locator CLR | `testdata/oci_lob.hex` |
+  | Thin, locators | `maxSize` · (`size` · `chunkSize`) · locator CLR, all compressed | `testdata/go_ora_lob_stream.pcapng`, `testdata/python_thin_lob.pcapng` |
+  | Thin, locators **with the LOB prefetched** | the same, plus the charset pair on a character LOB and the LOB's head as a CLR, all *before* the locator | `testdata/jdbc_thin_lob.pcapng` |
+  | Thin, inlined | the LOB's **own bytes** as a CLR, then its indicator and return code | `testdata/go_ora_lob.pcapng` |
+
+  So the 4-byte dialect's column is six bytes shorter than the skip it was being
+  given, and every row of such a fetch was refused — the same silent "no rows"
+  the LOB reading exists to end, one dialect over. All three locator spellings
+  give the locator's length **twice**, once ahead of the header and once as the
+  CLR length byte behind it, and only a column where the two agree is read as a
+  locator. A zero leading size is the NULL LOB and ends the column there.
+
+  The thin dialect's two rows in that table are the same server sending the same
+  query two different ways, and **nothing in its own frames tells them apart** —
+  the column records of the recordings are byte-identical. The difference was
+  asked for on the client's side, so that is where dbbat reads it: see "A thin
+  client says which LOB reading it wants" below.
+
+##### A thin client says which LOB reading it wants
+
+A LOB's contents are not normally in the row at all. A thin client that wants
+them says so, in a **define block** — an execute that declares no statement and
+carries one entry per column of a cursor already described — where it
+re-declares each LOB column as a LONG type. Oracle then sends a LONG column:
+the value, then its indicator and return code. Absent that, it sends a locator.
+
+Four recordings of one query, and they do not agree, which is the point:
+
+| Client | What it sends | What comes back |
+|---|---|---|
+| go-ora, nothing configured | a define turning CLOB into LONG VARCHAR (94) and BLOB into LONG RAW (24) | the bodies |
+| python-oracledb thin, nothing configured | a define keeping each LOB column the LOB type it already was | locators |
+| go-ora, `lob fetch=post` | no define at all | locators |
+| JDBC thin, nothing configured | a define keeping each LOB column its own type, and re-declaring the ordinary CHAR columns as VARCHAR2 | locators, each with the LOB's head prefetched in front of it |
+
+So inlining is go-ora's default rather than the thin dialect's, and the locator
+is what the protocol sends unless it was asked otherwise. `execDefineLOBShape`
+reads the ask off the client's own frame — once, before the rows exist, never
+out of the row bytes it would then be used to read — and `readRowColumn` branches
+on it. **A session that asked for nothing, or whose define dbbat could not walk,
+reads locators**, where a wrong walk costs the row rather than filling it with
+framing bytes.
+
+The walk is bounded the way the rest of this package's readings are: the entries
+have to be as many as the describe named, fill the frame to its last byte, and
+each declare the type the describe gave or one of two **measured** substitutions
+— at exactly one offset, or nothing is learned. Swept across every
+`testdata/*.pcapng` recording, exactly the three frames that are defines answer
+(`TestDefineBlockIsNotFoundInFramesThatAreNotOne`), and each recording read under
+the *other* client's reading comes back with no rows at all
+(`TestThinLOBFetchIsNotOfferedTheOtherReading`).
+
+The substitutions are a table rather than a rule, and **both are one-way**:
+
+| Describe says | A define may say | Read off | Meaning |
+|---|---|---|---|
+| CLOB / BLOB / BFILE | LONG (8), LONG RAW (24), LONG VARCHAR (94) | `go_ora_lob.pcapng` | the ask for the bodies |
+| CHAR (96) | VARCHAR2 (1) | `jdbc_thin_lob.pcapng` | no ask at all, just ojdbc's spelling |
+
+The reverse of either is refused. A CHAR declared as a LONG is a misread, not a
+LOB being inlined, and no client was ever recorded re-declaring a VARCHAR2
+column as a CHAR — accepting that direction too would widen the per-byte offset
+search back toward the near-miss the exact-match rule exists to close.
+
+Until this was read, `lob fetch=post` and **every python-oracledb thin LOB
+query** captured nothing: the walk read the locator as an inlined value, came
+out on the wrong byte, and `rowEndsAtMarker` cost the row.
+
+JDBC thin is the fourth recording, and it is what bought the CHAR → VARCHAR2
+row of that table. Until 2026-09-23 `defineTypeAgrees` refused its define, so
+**no JDBC thin session ever stated a reading**, whatever it was asking for. It
+cost nothing at the time — what JDBC asks for is locators, which is what an
+unread define leaves the session on — but a future JDBC deployment that *did*
+ask for inlining would have been silently refused, which is the failure mode
+this whole reading exists to end. Reading the frame changed what dbbat learns
+and not what it captures: the row is byte for byte the one the refusal produced
+(`TestJDBCThinLOBFetchCapturesItsLocators` is unchanged, and
+`TestJDBCThinDefineBlockIsReadAndLearnsTheLocator` asserts the mechanism).
+What JDBC *also* does is prefetch the LOB
+(`oracle.jdbc.defaultLobPrefetchSize`, non-zero out of the box), so the head of
+the value rides in front of the locator; `skipPrefetchedLOBValue` steps over it
+and the column still captures the placeholder, because the head of a LOB is not
+the LOB. Until that was measured, **every JDBC thin LOB query captured no rows
+at all**.
+
+- **Opaque / object** — the image header is *read*, not measured: the image
+  length arrives twice, as a four-byte little-endian field and as a single byte,
+  with a constant `0x01 0x00` between them. Two spellings of one number agreeing
+  is what makes a hit a measurement, and it is also why the walk needs no
+  per-dialect constant (the framing ahead of the header is 12 bytes on the
+  64-bit dialect and 14 on the 4-byte one). `readObjectImage` returns the bytes
+  between that header and the next column, and `decodeObjectImage` reads them —
+  see "An object column captures its image" below.
+
+- **LONG / LONG RAW** — the value, then the column's **indicator** and **return
+  code**, the pair a NULL spells `-1` and `1405` (ORA-01403, "fetched column
+  value is NULL"). It is the same shape an *inlined LOB* arrives in, and that is
+  not a coincidence: go-ora's default LOB policy works by re-declaring the
+  column as a LONG, so what it gets back is a LONG column. Until this was
+  measured (2026-09-22) only the substitution had been recorded, and a column
+  the **describe itself** reported as LONG was read as a scalar — the walk read
+  its value and then started the next column on the indicator byte, so the row
+  drifted and was refused. Four recordings of two queries, and they split two
+  ways:
+
+  | Dialect | What a LONG column carries | Recording |
+  |---|---|---|
+  | Thin | value CLR (`0xFE` chunks, compressed lengths) · indicator · retCode, all compressed | `testdata/go_ora_long.pcapng`, `testdata/python_thin_long.pcapng` |
+  | Both OCI | `fe` · chunkLen ub4 LE · chunk · … · `0` ub4 · indicator ub2 · retCode ub2 | `testdata/oci_long.hex`, `testdata/oci64_long.hex` |
+
+  So the split is the familiar one, compressed integers against fixed-width
+  fields — except that here the **two OCI dialects agree with each other byte
+  for byte**, which they do nowhere else in this section. A NULL is the empty
+  CLR with the same pair behind it (`81 01` / `02 05 7d` on thin, `ffff 7d05` on
+  OCI). The value arrives in the `0xFE` long form whatever its length, which an
+  inlined LOB did not, so the thin reading takes the chunk-length spelling from
+  the session's negotiated `UseBigClrChunks` (`oerShape.bigClrChunks`, stamped
+  from the pre-auth relay) rather than assuming one.
+
+  The long form is the **CLR's** rule rather than a LONG column's habit, which
+  is why the same reader serves both and why it fixes a case that predates it:
+  an inlined LOB past the 252 bytes a single length byte can carry is chunked
+  too, and every such fetch was losing its row. `testdata/go_ora_lob_big.pcapng`
+  is that measurement — the same client and the same default LOB policy on a
+  300-character CLOB, whose value opens with `0xFE`. Read as a length that meant
+  254 bytes of a 300-byte value, so the next column started inside it.
+
+Because those skips are measured, a row that used one is kept **only** when the
+columns after it come out on something that can legitimately follow a row: the
+`0x07` / `0x15` separators, the `0x08` footer, or the **summary object that ends
+the call**. A skip that is wrong on some future server costs that row rather
+than filling it with framing bytes. Rows with no framed column in them are
+unaffected and are accepted wherever they end, exactly as before.
+
+That fourth terminator is a finding of its own, from the same recordings: only
+go-ora puts the `0x08` footer in front of the summary object. python-oracledb
+thin runs its last row straight into it on every fetch, and sqlplus does so on
+the round trip that returns the result set's final row — so on those clients the
+**last row of every fetch with a framed column in it** was being refused, LOB
+and object columns included. Each encoding is accepted under its own proof,
+never on the `0x04` marker byte alone:
+
+- the **compressed** one must decode *and* report ORA-01403. Its seven fields
+  are weak enough on their own that a run of zeroes decodes as a plausible
+  success, so end-of-data is the whole of its proof.
+- the **fixed-width** one must satisfy both its layout invariant — the error
+  number repeated as the RetCode 66 bytes on, a non-zero call status
+  (`decodeOERFieldsAtLayout`) — *and* `plausibleStatusOER`, the bound
+  `findPlausibleOERInResponse` already applies to the same object: success or
+  end-of-data, a sequence number inside its 16-bit field, a real cursor id.
+  Both halves are load-bearing. The layout invariant alone is satisfied by a
+  summary object reporting *any* failure, and accepting one of those as "the row
+  ended here" would be worse than the bug this replaced — a refused row is lost
+  loudly, a drifted row that lands on an accepted terminator is presented as a
+  measurement. End-of-data alone is not available either: what sqlplus sends
+  behind its last row reports plain success (`callStatus 1, errNum 0,
+  cursorID 2`).
+
+Both directions are pinned away from the corpus, in
+`TestRowEndsAtMarker_AcceptsTheFourThingsThatCanFollowARow` and
+`TestRowEndsAtMarker_RefusesWhatIsNotAnEnding` — the negative half has to be
+synthesized, because a real server does not put a summary object behind a row it
+is still sending.
+
+**What a LOB column captures, and why it is not the data.** A locator is a
+handle into the server: it names a LOB, changes from fetch to fetch, and the
+contents are not in the packet at all. A client that wants them asks for them in
+round trips of its own. dbbat does not and must not — a proxy issuing reads on
+the session's behalf is a statement the user never wrote — so the column is
+captured as `<CLOB locator>`, `<BLOB locator>` or `<BFILE locator>`: a marker
+naming the type, distinguishable from real data and from a NULL, which still
+captures as `""`.
+
+The same rule read the other way is why a thin session that asked for the
+**bodies** captures the value instead: there the contents *are* in the packet,
+because the client asked the server to inline them. The deciding fact is where
+the data is, not which type the column has — and on the thin dialect that is
+decided per session, by the client, which is why it is read off the client's own
+define block rather than assumed.
+
+#### An object column captures its image, not the locator in front of it
+
+An **opaque or object** column is not in the LOB's position, and it no longer
+captures like one. Its value is not somewhere else on the server: the object's
+own image travels a few bytes further along the same row, and the walk above was
+already measuring exactly where it starts and ends in order to find the next
+column. It threw those bytes away.
+
+The image opens with a flag byte, then its **own** length as a TTC compressed
+integer — a third spelling of the number the outer header already gave twice,
+and the check that makes this a reading rather than a cast. Two flags are
+decoded:
+
+| Flag | Shape | Recorded image | Captured as |
+|---|---|---|---|
+| `0x84` | a named object type: the attributes, each an ordinary CLR | `84 01 08 · 02 c1 02 · 01 78` | `(1, x)` |
+| `0x85` | an opaque type (`SYS.XMLTYPE`): a `0x01`, a big-endian ub4 kind, then the payload | `85 01 0c · 01 · 00000014 · 3c 61 2f 3e` | `<a/>` |
+
+Those two images are the whole corpus: `testdata/` carries them and nothing else
+of this shape — `oci_describe.hex` and `oci64_describe.hex` hold the first
+(`dbbat_cap_obj(1, 'x')`), `oci_lob.hex` and `oci64_lob.hex` the second
+(`XMLTYPE('<a/>')`). Each is recorded on **both** OCI dialects, and the two
+recordings of the object captured *different* locators for the same value
+(`…5c0f1a6dae5600fc…` against `…5c0f18b7351e0110…`, forty seconds apart against
+the same row) while their images match to the byte. That is the argument in one
+line: the locator is a per-fetch handle, the image is the value. The reading
+also agrees with go-ora's own — same flags, same compressed length, same
+`0x01`-then-ub4 header on the opaque one.
+
+A named object's attributes carry **no types**: the row says how long each one
+is and nothing more, and the describe names the object's type without describing
+its shape. So each attribute is rendered by `decodeOracleRawValue`, the same
+type-less reading this package already applies wherever a column's type code is
+not known — which is what turns `c1 02` into `1` and `78` into `x` rather than
+into hex.
+
+Everything not measured **fails closed to the locator hex the column captured
+before**, which is a value rather than a lost row: the `0x88` collection flag, an
+opaque kind other than text (`0x11` is a LOB locator, so that payload is not in
+this packet either), an attribute walk that does not land exactly on the image's
+end, and the `0xFE`/`0xFF` CLR forms — a chunked or NULL attribute, neither of
+which has been recorded. See `TestObjectImageDecodesOrKeepsTheLocator` and
+`TestUnreadableObjectImageKeepsTheLocatorHex`.
 
 #### DML status (OER, func=0x04)
 
@@ -2705,6 +3140,19 @@ So the tag is affordable, and `DBB_QUERY_TAGGING_ORACLE=user` turns it on. It is
 an operator who accepted it on PostgreSQL did not accept it here. `off` is the
 default and the only other value; anything else fails the process at startup.
 
+The variable is the **deployment default**, not the switch. The `tagging.oracle`
+global parameter wins over it when set, and that parameter is edited from the
+Settings page or through `PUT /api/v1/instance/tagging`, with no restart — which
+is the point, because the cursor cost above is exactly the kind of thing an
+operator wants to stop paying within seconds of seeing it. The same two values
+apply, and anything else is a `400` on write rather than a startup failure: a
+settings write that crashed every replica on its next restart would be a worse
+failure than the one it is modeled on. A value that reaches the store anyway
+resolves to `off` with a WARN. The mode is read **once per session, at
+authentication**, so a live session keeps the decision it authenticated under —
+the same all-or-nothing rule the locator already imposes, for the same
+two-SQL_IDs reason.
+
 ### What had to exist first: a TTC statement writer
 
 Every other protocol re-encodes each message on its way upstream, which is why
@@ -2740,8 +3188,36 @@ The surface, all of it:
 |---|---|---|---|
 | thin exec `03 5e` (also stapled behind `11 69`) | go-ora, python-oracledb thin | TTC compressed int, **width grows with the value** | CLR short form: the length repeated as one byte in front of the text |
 | same op | ojdbc thin, DBeaver | same | **bare run** — the header field is its only length |
-| OCI wide exec | sqlplus, SQL\*Developer, Instant Client | `sqlLen * 3` as a little-endian ub4 behind the `fe x8` sentinel, fixed width | CLR short form, sometimes including a trailing NUL in the declared length |
+| OCI wide exec, **4-byte dialect** | sqlplus, SQL\*Developer, Instant Client | `sqlLen * 3` as a little-endian ub4 at offset 21, behind the `fe x8` sentinel, fixed width | CLR short form, sometimes including a trailing NUL in the declared length |
+| OCI wide exec, **64-bit dialect** | the sqlplus bundled in `gvenzl/oracle-free:23-slim` — the client CI runs | the **plain byte count** as a little-endian ub8 at offset 33, behind the same `fe x8` sentinel, fixed width | same |
 | `OALL8` (pre-v315) | legacy | `decodeVarLen`: 1 byte / `0xFE`+2BE / `0xFF`+4BE, width grows | none; the bind count sits immediately behind the text |
+
+The two OCI rows are one field list at two widths (see "Two OCI encodings, not
+one"), and they are separate rows because widening the first one would have been
+wrong twice over: the 64-bit header spends **eight** bytes on the sequence pad
+where the 4-byte one spends one — so options land at 17, the cursor id at 21, the
+sentinel at 25 and the length at 33 — and its length is the statement's byte
+count **rather than three times it**. Reading it with the `sqlLen * 3` convention
+would have declared three times the statement and re-encoded it consistently, so
+the round-trip identity would have passed while the server read a third of it.
+Which reading applies is decided by the session's learned dialect
+(`clientWide64Encoding`, off the client's own AUTH Phase 1), never by trying one
+layout after another: exclusively, the way `execNoStatementCursorAt` selects,
+because the exec headers are each other's near-misses.
+
+**This is the dialect the tag did not reach until 2026-09-22.** `stmtLenKind`
+named three encodings, none of them this one, so `execSQLLengthWideField` refused
+the header, `locateStatementRewrite` could not certify the frame, and — exactly
+as designed — every session on that client ran untagged start to finish. The
+behaviour was correct by the rule below; what was missing was the reading. It is
+`stmtLenWide64UB8` / `execSQLLengthWide64Field` now, measured against
+`testdata/oci64_parse_execs.hex` (`TestSurveyStatementRewriteWide64OCI`: all three
+recorded parses locate, rewrite to themselves byte for byte, and read back as the
+tagged statement) and live against a real 23ai by
+`TestIntegration_StatementTagFromOCIClient` and
+`TestIntegration_StatementTagFromOCIPLSQLCall` with
+`ORACLE_TEST_OCI_CLIENT=container` — both of which asserted `tagged=1` and were
+red on that client for this one reason.
 
 **OALL8 is written but not wired** (`oall8RewriteEnabled = false`). No recording
 in `testdata/` carries one and no client the e2e suite drives sends one, so
@@ -2752,7 +3228,7 @@ the run against itself and only the length half does any work. The encoder stays
 unit-tested as the specification of what to re-enable once a real OALL8 capture
 exists; see `specs/todos/2026-09-16-11-oracle-tag-oall8-rewrite.md`.
 
-Two of the three length encodings change *width* with their value, so growing a
+Two of the four length encodings change *width* with their value, so growing a
 statement can shift every byte behind the field — which is why the rewriter
 rebuilds the message rather than patching it. The CLR format change at 252 bytes
 is the one a tag provokes directly: a ~50-byte tag is exactly what pushes a
@@ -2802,6 +3278,24 @@ itself byte for byte and reading back as the tagged statement, across all five
 recorded client shapes (go-ora and python-oracledb thin as
 `compressed`/`clr-short`, ojdbc thin and DBeaver as `compressed`/`bare`, sqlplus
 as `wide-ub4`/`clr-short`).
+
+The sixth shape, `wide64-ub8`/`clr-short`, is not in that count and cannot be:
+no recording in `testdata/*.pcapng` is a 64-bit OCI session, because a bare relay
+never decodes that client's frames and so never records usable ones (see
+`ociFixtureProvenance`). It gets the same two properties against the hex fixture
+recorded through dbbat instead — `TestSurveyStatementRewriteWide64OCI` over
+`testdata/oci64_parse_execs.hex`, identity and round trip on all three parses,
+plus the length field read out of the frame's own bytes so that the plain-byte-
+count convention is pinned by something other than dbbat agreeing with itself.
+Two guards sit beside it, because a dialect selected by a flag has two ways to
+be wrong rather than one: `TestWide64StatementRewriteIsSelectedByTheSessionNotByTheBytes`
+requires that a 64-bit parse is refused under the other dialects' readings **and**
+that all 186 corpus frames are refused under the 64-bit one, so a mis-flagged
+session fails closed instead of overwriting eight bytes of somebody else's
+header; and `TestWide64DrivesCarryNoStatementToTag` requires that this dialect's
+`PRINT rc` drives are not offered to the locator at all — reading one as a frame
+the locator cannot certify is what would leave a whole sqlplus session untagged
+over a frame that never carried a statement.
 
 **A shape that was thought to be outside that count, and is not.** While the
 REF-cursor fixtures were being recorded (2026-09-19) an sqlplus session running
@@ -3487,6 +3981,142 @@ surfaced there: `parseRowStream` treated a leading `0x08` as the end-of-rows foo
 the full footer fixes it. SQLcl SELECT results (columns + rows, single- and multi-row) are
 now captured like any other client.
 
+##### The 64-bit dialect's rows are behind a wider ROW_HEADER
+
+`scanRowValues` takes the same **encoding** axis `parseColumnDescribes` does, and for the
+same reason: reading a 64-bit OCI session's describes fixed its column *names* and left its
+values untouched, so its captured rows went from empty objects with no keys to empty objects
+with the right keys. Measured 2026-09-22 over both describe fixtures, one row per frame: the
+4-byte one yielded a row on the login probe and on the eight-column query, the 64-bit one
+yielded nothing on either.
+
+The values are not the problem and never were — a one-byte length then that many raw bytes,
+byte-for-byte the same shape in both dialects, which is what let the two fixtures be compared
+value for value. What differs is the **ROW_HEADER** object (`0x06`) standing in front of the
+`0x07` that opens the row data. The reading this replaced located it by the two-byte pair
+`06 22`; on this dialect the header opens `06 01 22 xx`, so that pair occurs nowhere in the
+payload at all and the row area was never entered.
+
+Read off `testdata/oci64_describe.hex` against its 4-byte counterpart, on the two frames that
+carry a header — the login probe and the eight-column query, which is what varies the one
+field either reading takes from it:
+
+|  | 4-byte dialect | 64-bit dialect |
+|---|---|---|
+| +0 | `0x06` ROW_HEADER | `0x06` ROW_HEADER |
+| +1 | `0x22` / `0x02` flag | `0x01` |
+| +2 | ub4 column count | `0x22` / `0x02` flag |
+| +3 | | padding, stale (`0xaf` / `0x59`) |
+| +4 | | ub4 column count |
+| +6 / +8 | ub2 = 0, ub2 = array size | ub8 = `0x10000` |
+| +10 / +16 | 3 × ub4 = 0 | 4 × ub8, then a ub2 = 0 |
+| +22 / +50 | `0x07` ROW_DATA | `0x07` ROW_DATA |
+
+**What says the wider tail is that field list at 64-bit widths** — rather than a guess that
+happens to total 50 — is where the non-zero bytes fall. Two of those four ub8 slots carry a
+non-zero **upper** half (`ffffa5a9…`, `ffffa382…` / `0001a382…`) over a zero lower half, at
+the same two offsets in both frames. That is what a 64-bit struct looks like when the server
+writes a 32-bit value into it and leaves the top half stale, and it is also why nothing reads
+those slots: their low halves are zero in every sample, so the corpus says what the layout is
+and nothing about what the fields mean. The 4-byte dialect's pair at +6 is unread for the same
+reason — the first half is zero everywhere, and the second is the fetch's array size (1 on
+both describe frames, 15 on `sqlplus_refcursor.pcapng`, which is what says it is a field
+rather than padding).
+
+`wide64RowDataStartAt` therefore reads exactly one field, the column count, and **fails
+closed**: the count must be the describe's own and the `0x07` must land exactly where the
+header ends. Nothing is scanned for, so a payload offered the wrong reading yields no rows,
+which is the behaviour the dialect had before — not different ones.
+`TestOCI64RowHeaderPatternIsUniqueInTheCorpus` is what licenses the hard-coded length: run
+over every frame of every `.hex` fixture *without* the column-count check, every match is a
+real 64-bit ROW_HEADER, at the count its own describe declares — and there is none on a
+4-byte or compressed payload. The test pins the whole list, so a reading that started
+matching one byte more loosely would have to say where.
+`TestOCI64RowCaptureCarriesTheDescribesValues` holds the result
+to the bar `TestOCIRowCaptureCarriesTheDescribesColumnNames` sets, against the 4-byte
+fixture's own values column for column (the two temporal columns excepted, the recordings
+being ~40 s apart).
+
+> The third frame of **both** fixtures — `ociDescribeTypedQuery`, whose select list carries a
+> CLOB and an XMLTYPE — still captures no row, under either dialect. That is a different
+> defect with its own spec
+> (`2026-09-22-03-oracle-row-capture-drops-every-row-of-a-fetch-carrying-a-lob.md`): neither
+> frame carries a ROW_HEADER at all, so there is nothing here for this reading to find.
+
+##### A fetch's second packet flags its ROW_HEADER differently
+
+The flag byte in that table is `0x22` on the **first** packet of a fetch and `0x02` on every
+round trip after it. One bit, `0x20`, and nothing else moves.
+
+Measured on `testdata/oci_long.hex`, whose frames 2 and 3 are the two round trips sqlplus
+fetches one four-column result set over: across the whole 22-byte header the only byte that
+differs is the flag. `testdata/oci64_long.hex` records the same two round trips in the 64-bit
+dialect and agrees — there the flag, the padding byte behind it, and the stale **upper**
+halves of two ub8 slots nothing reads are what differ, while every field either reading looks
+at is byte-identical.
+
+Demanding `0x22` therefore cost a 64-bit OCI session **every packet of a fetch after the
+first**, whatever its columns: the header reading refused it, and the 25-byte fallback scan in
+`parseContinuationRows` cannot reach past a 50-byte header to rescue it. The 4-byte dialect
+hid the same defect, its header being short enough for that scan to find the `0x07` — the
+packet was stumbled upon rather than located, which is the distinction the header readings
+exist to make.
+
+Both readings now take the flag through `isRowHeaderFlag`, which masks `0x20` off and compares
+the rest. Since that is the only bit either recording varies, masking accepts exactly the two
+observed values and no third:
+`TestOCIRowHeaderFlagIsTwoStatesAndNothingElse` substitutes all 256 values into the real
+header, on both packets of both dialects, and exactly two of them may locate the row data.
+Everything else stays as it was — the column count must still be the describe's own, and the
+ROW_DATA byte must still land exactly where the header ends.
+
+It went unseen because no fixture had a multi-packet fetch until the LONG recordings: every
+other OCI recording in the corpus returns its rows in a single packet.
+
+##### Seven columns, and why the other two dialects stopped scanning too
+
+The 64-bit reading above was written as a measurement because a scan could not work there.
+The other two kept theirs, and it had a live bug in it that no fixture could show.
+
+`findRowDataStart` anchored on `06 22` and then scanned **forward from the very next byte**
+for the first `0x07`, calling what followed it the first row. Read the table again: the very
+next byte is the start of the header's own **column count**. Both of those dialects spell
+seven there as the single byte `0x07` — `07 00 00 00` as a little-endian ub4 on the 4-byte
+one, `01 07` as a TTC compressed int on the compressed one. So a query with exactly seven
+columns landed at `idx+3` instead of `idx+23`, and `parseRowStream` read lengths out of the
+middle of the header. It did not produce the row; it produced whatever the header's remaining
+zeros looked like.
+
+Nothing caught it because the corpus had no seven-column fetch: the recorded describes carry
+one, eight and six columns, so every fixture agreed with the wrong reading. Two recordings
+now close that — `testdata/oci_sevencols.hex` (sqlplus through dbbat, whose header opens
+`06 22 07 00 00 00`) and `testdata/go_ora_sevencols.pcapng` — and `sevencols_test.go` holds
+both, plus synthesized headers at counts six, seven and eight so the landing is stated as the
+layout rather than as one recording's bytes.
+
+Both readings are now measured the way the 64-bit one is:
+
+- **4-byte OCI** (`wideRowDataStartAt`): a fixed 22 bytes, the left column of the table above,
+  pinned by the two frames of `testdata/oci_describe.hex` that carry a header and the four in
+  `sqlplus_*.pcapng` (counts 1, 2 and 3).
+- **Compressed / thin** (`compressedRowDataStartAt`): no fixed length, its integers being
+  self-sizing, so the header is **walked** — `0x06`, the `0x22` flag, six TTC compressed
+  integers, then `0x07`. The field list is the 4-byte dialect's, counting the ub2 pair at +6
+  separately, which is what says six is the count rather than a number that happened to fit.
+  Pinned across `go_ora*`, `python_thin*`, `jdbc_thin*`, `dbeaver*` and `ojdbc6_legacy` at
+  column counts 1, 2, 3, 4, 6, 9, 15, 35 and 45. Only two of the six ever vary: the count, and
+  the third field, which is the client's prefetch size (10 for the JDBC thin driver, 25 and
+  1000 for go-ora, 2 and 100 for python-oracledb). The other four are a single `0x00` in every
+  sample, so whether they are integers or bare bytes is not something the corpus can say; they
+  are walked as integers because the 4-byte dialect spells the same tail as three ub4s, and a
+  compressed walk of a zero byte consumes one byte either way.
+
+All three now fail closed on the same two checks — the header's own column count must be the
+describe's, and the ROW_DATA byte must land exactly where the header ends — so a wrong landing
+yields no rows rather than a row of garbage. That also takes the readings off the `06 22`
+pairs that occur *inside* row data, which the midfetch recordings carry several of and the
+forward scan would have followed.
+
 #### A mid-fetch `0x08` is row data, not a Response
 
 The byte at TNS payload offset 2 is only a TTC function code **at a call boundary**. While
@@ -3884,14 +4514,17 @@ by unit tests on both dialects.
 client, `fixed_width=true fixed_width_64=false` against a 64-bit client is the whole bug,
 and nothing else in the log distinguishes the two layouts.
 
-**The same flag is what two statement-gate readings key on**, and they were added
-later: the REF-cursor bind-output walk (`refcursor_bind_wide64.go`) and the
-SQL-less execute's cursor id (`execWide64NoStatementCursor`). Both had held for
-the 4-byte dialect only, which meant every cursor re-execution on the 64-bit one
-— the dialect CI runs — was forwarded ungated. See "Learning a REF cursor's id"
-and "Cursor re-execution"; the point to carry over here is that a new reading
-added for one OCI dialect is not a reading for the other, and the flag is how
-each is offered to its own session and to nothing else.
+**The same flag is what three statement-gate readings key on**, and they were
+added later: the REF-cursor bind-output walk (`refcursor_bind_wide64.go`), the
+SQL-less execute's cursor id (`execWide64NoStatementCursor`), and the statement
+decode itself (`execSQLLengthWide64Field`, reached through
+`execSQLLengthFieldFor`). Each had held for the 4-byte dialect only, which meant
+every cursor re-execution on the 64-bit one — the dialect CI runs — was
+forwarded ungated, and every statement on it was read by the window scan. See
+"Learning a REF cursor's id", "Cursor re-execution" and "The 64-bit exec header
+reaches the gate, not just the rewriter"; the point to carry over here is that a
+new reading added for one OCI dialect is not a reading for the other, and the
+flag is how each is offered to its own session and to nothing else.
 
 #### OCI break/reset before AUTH Phase 2 — root cause and fix
 

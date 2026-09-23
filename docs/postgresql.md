@@ -108,6 +108,15 @@ comment to every statement it forwards:
 `conn=` is the same 12 hex characters as `application_name`'s `c=` tag, so it
 feeds the same `GET /api/v1/connections?uid_suffix=` lookup.
 
+The variable is the **deployment default**, not the switch. The `tagging.enabled`
+global parameter wins over it when set — in both directions, so a stored `false`
+turns tagging off on a deployment that ships `DBB_QUERY_TAGGING=true` — and that
+parameter is edited from the Settings page or through
+`PUT /api/v1/instance/tagging`, with no restart. The decision is resolved **once
+per session, at authentication**: a session already running keeps what it
+authenticated under, because a statement tagged on some executions and not
+others would get two digests where the point is one.
+
 **Off by default.** It changes the bytes the database receives, so a
 deployment that pins statement text — a `pg_stat_statements` allowlist, a
 query firewall, a per-statement plan cache — turns it on knowingly.
@@ -194,6 +203,36 @@ oldest in-flight statement passes `limit + 2s`. Several statements can be in
 flight at once under the extended protocol, so the clock holds the *oldest*
 start (`extendedState.pendingQueries`) and is re-armed from the next pending one
 on completion. A `COPY` in progress is a statement.
+
+The extended protocol gives an `Execute` **four** possible terminators, and all
+four complete the statement's row: `CommandComplete`, `ErrorResponse`,
+`EmptyQueryResponse` (the statement was the empty string — DataGrip sends one
+right after it sets its `application_name`) and `PortalSuspended` (the
+`Execute` carried a row limit and the portal has more rows — DataGrip pages
+every result grid). The last two carry no command tag, so they complete the row
+with no rows affected; and a suspended portal is **idle, not executing** — the
+backend is waiting for the client to ask for the next page, which the server's
+own `statement_timeout` agrees with — so the clock stops there, and the
+follow-up `Execute` on the same portal is its own pending query with its own
+terminator. Missing the last two is what used to park a stale entry on every
+paged grid and empty statement: from the first stale entry on, every pop took
+the wrong item, the last statements of the session were never completed, and
+the clock stayed armed on an idle backend — an idle session got killed
+`limit + 2s` after its *last* statement.
+
+Behind the four terminators there is a protocol backstop: upstream sends one
+`ReadyForQuery` per message that earns one (a forwarded `Sync` or a forwarded
+simple `Query`), and the protocol guarantees nothing from before that message
+is still running when it arrives. Every pending entry stamped with a lower
+epoch belongs to a batch that is already over — an upstream `ErrorResponse`
+mid-batch makes the server discard the rest of the batch until `Sync`, so a
+later `Execute` the client had already sent gets no terminator — and is
+finished at the `ReadyForQuery` with `no completion message from upstream`
+instead of parking the clock on a finished statement. A pipelined client's
+later batch carries the higher epoch and survives the first `ReadyForQuery`,
+so the reconcile counts rather than drains. On a termination, the row
+completed with the limit text is the **oldest** in-flight entry — the statement
+the clock measured — and the other pending entries are completed as aborted.
 
 On a trip dbbat sends a **`CancelRequest`** carrying the upstream's
 `BackendKeyData` before closing anything. It goes on a *fresh* connection — the

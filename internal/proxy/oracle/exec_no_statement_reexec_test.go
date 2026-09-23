@@ -247,7 +247,7 @@ func TestOJDBC6ReexecDoesNotDisturbTheParsePath(t *testing.T) {
 	for _, name := range surveyCorpus(t) {
 		for _, ttc := range surveyClientTTC(t, loadTestDump(t, name)) {
 			for _, body := range surveyExecOps(ttc) {
-				sql, located := decodeExecStatement(body)
+				sql, located := decodeExecStatement(body, false)
 				_, reexec := execNoStatementCursor(body, false)
 
 				require.Falsef(t, located && reexec,
@@ -294,12 +294,46 @@ func TestOJDBC6ReexecDoesNotDisturbTheParsePath(t *testing.T) {
 	// `oci_refcursor_drives.hex` fixture pair alone — so this is the line that
 	// makes a regression in it fail here. Two rather than three because sqlplus
 	// drives the cursor the script asks it to print, and the script prints twice.
+	// The two LOB entries are not REF cursors, and they are the same frame as
+	// each other: the **define block** a thin client sends when it has a cursor
+	// described and something to say about how its columns come back. With a
+	// LOB in the select list Oracle turns row prefetch off, so the describe
+	// arrives empty and the client re-executes the cursor it was just given —
+	// go-ora re-declaring its LOB columns as LONG to get the bodies inlined,
+	// python-oracledb thin re-declaring them as the LOB types they already are.
+	// That frame is what execDefineLOBShape reads. go_ora_lob_stream.pcapng is
+	// absent for the reason inverted: it asks for nothing, so there is no
+	// define, and the server prefetches the row into the describe.
+	//
+	// go_ora_lob_big.pcapng's one is the same define as go_ora_lob.pcapng's, on
+	// the recording made for a 300-character CLOB: the value's length changes
+	// nothing about the ask.
+	//
+	// jdbc_thin_lob.pcapng's one is a define too, and execDefineLOBShape reads it
+	// since 2026-09-23: ojdbc re-declares the ordinary CHAR columns as VARCHAR2
+	// (1), a substitution defineTypeAgrees now carries one-way alongside the
+	// LOB → LONG one. What it states is locators, which is what the unread define
+	// left the session on anyway, so the reading changed and the row did not. See
+	// TestJDBCThinDefineBlockIsReadAndLearnsTheLocator.
+	//
+	// go_ora_long.pcapng's two are the same frame again, one per query, and they
+	// say the prefetch-off rule is the column's rather than the LOB's: a
+	// **genuine** LONG column turns it off too. The define re-declares each
+	// column as exactly what the describe reported — `96 8 96 96` and
+	// `96 24 96 96`, no substitution, because a column that is already a LONG
+	// has nothing to be re-declared as. python_thin_long.pcapng is absent
+	// because python-oracledb thin sends no define there at all.
 	assert.Equal(t, map[string]int{
 		"ojdbc6_legacy.pcapng":         1,
 		"go_ora_refcursor.pcapng":      3,
 		"jdbc_thin_refcursor.pcapng":   3,
 		"python_thin_refcursor.pcapng": 5,
 		"sqlplus_refcursor.pcapng":     2,
+		"go_ora_lob.pcapng":            1,
+		"python_thin_lob.pcapng":       1,
+		"go_ora_long.pcapng":           2,
+		"go_ora_lob_big.pcapng":        1,
+		"jdbc_thin_lob.pcapng":         1,
 	}, reexecs, "only these recordings carry an execute that declares no statement")
 }
 

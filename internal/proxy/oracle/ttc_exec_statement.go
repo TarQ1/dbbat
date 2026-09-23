@@ -68,8 +68,13 @@ func isPiggybackExecHeader(ttcPayload []byte) bool {
 // has always called "the JDBC exec": every `11 69` in the corpus that carries
 // SQL is a close list followed by `03 5e <exec>`, and the `11 98` sub-op in
 // dbbat's anchor list appears in no recording at all.
-func decodeExecStatement(ttcPayload []byte) (string, bool) {
-	stmt, ok := decodeExecStatementText(ttcPayload)
+//
+// wide64 says the session has learned its client writes the 64-bit OCI op
+// header, and it selects that dialect's header reading exclusively — the same
+// rule, and the same reason, as execNoStatementCursor's. See
+// execSQLLengthFieldFor.
+func decodeExecStatement(ttcPayload []byte, wide64 bool) (string, bool) {
+	stmt, ok := decodeExecStatementText(ttcPayload, wide64)
 
 	return stmt.Text, ok
 }
@@ -99,13 +104,13 @@ type execStatement struct {
 }
 
 // decodeExecStatementText is decodeExecStatement keeping the verbatim run.
-func decodeExecStatementText(ttcPayload []byte) (execStatement, bool) {
-	if stmt, ok := decodeExecStatementAt(ttcPayload); ok {
+func decodeExecStatementText(ttcPayload []byte, wide64 bool) (execStatement, bool) {
+	if stmt, ok := decodeExecStatementAt(ttcPayload, wide64); ok {
 		return stmt, true
 	}
 
 	if end, ok := closeCursorsEnd(ttcPayload); ok {
-		if stmt, ok := decodeExecStatementAt(ttcPayload[end:]); ok {
+		if stmt, ok := decodeExecStatementAt(ttcPayload[end:], wide64); ok {
 			if stmt.End > 0 {
 				stmt.End += end
 			}
@@ -119,12 +124,12 @@ func decodeExecStatementText(ttcPayload []byte) (execStatement, bool) {
 
 // decodeExecStatementAt is decodeExecStatementText for a payload that must
 // already begin at the exec op header.
-func decodeExecStatementAt(body []byte) (execStatement, bool) {
+func decodeExecStatementAt(body []byte, wide64 bool) (execStatement, bool) {
 	if !isPiggybackExecHeader(body) || len(body) < execHeaderMinLen {
 		return execStatement{}, false
 	}
 
-	sqlLen, ok := execSQLLength(body)
+	sqlLen, ok := execSQLLength(body, wide64)
 	if !ok {
 		return execStatement{}, false
 	}
@@ -160,14 +165,20 @@ func decodeExecStatementAt(body []byte) (execStatement, bool) {
 //	[5..12] options       8 bytes
 //	[13..20] fe x8        pointer sentinel
 //	[21..24] sqlLen*3     uint32 little-endian   <- this
-func execSQLLength(body []byte) (int, bool) {
-	field, ok := execSQLLengthField(body)
+//
+// OCI **64-bit** encoding (sqlplus 23.x, the dialect CI runs) — the same field
+// list at that client's widths, with the length as a plain little-endian ub8;
+// see execSQLLengthWide64Field for the offsets and for why the value is *not*
+// multiplied by three. It is reachable only when wide64 says the session
+// learned its client writes that header, never by trying it as a fallback.
+func execSQLLength(body []byte, wide64 bool) (int, bool) {
+	field, ok := execSQLLengthFieldFor(body, wide64)
 
 	return field.value, ok
 }
 
 // execSQLLenField is where an exec op declares its statement's length, and in
-// which of the two encodings execSQLLength knows.
+// which of the three encodings execSQLLength knows.
 //
 // It exists for the rewriter, which has to put a *different* number in that
 // field: a decoder only needs the value, an encoder needs the exact span it
@@ -180,11 +191,27 @@ type execSQLLenField struct {
 	kind  stmtLenKind
 }
 
-// execSQLLengthField is execSQLLength keeping the field's position. The two
-// share one walk deliberately: a second implementation of "where does this
-// header declare its length" is exactly the drift that would let the gate read
-// one field and the rewriter overwrite another.
-func execSQLLengthField(body []byte) (execSQLLenField, bool) {
+// execSQLLengthFieldFor is execSQLLength keeping the field's position, told
+// which OCI dialect the session speaks. The two share one walk deliberately: a
+// second implementation of "where does this header declare its length" is
+// exactly the drift that would let the gate read one field and the rewriter
+// overwrite another.
+//
+// The 64-bit header is reachable only this way, and deliberately: its reading is
+// selected by what the session **learned** about its client
+// (`session.clientWide64Encoding`, see execNoStatementCursor), never by trying
+// one layout after another until one answers. The three exec headers are each
+// other's near-misses, so a dialect offered as a fallback is a dialect that will
+// eventually answer for a frame it does not own.
+//
+// The wide64 reading is therefore exclusive rather than additive: on such a
+// session the 4-byte and thin walks are not consulted at all, the same way
+// execNoStatementCursorAt does not consult them.
+func execSQLLengthFieldFor(body []byte, wide64 bool) (execSQLLenField, bool) {
+	if wide64 {
+		return execSQLLengthWide64Field(body)
+	}
+
 	if field, ok := execSQLLengthWideField(body); ok {
 		return field, true
 	}
@@ -545,7 +572,8 @@ func execWide64NoStatementCursor(body []byte) (uint16, bool) {
 const wideCharWidth = 3
 
 // It keeps the field's position as well as its value, for the same reason
-// execSQLLengthField does: a decoder needs the number, an encoder needs the span.
+// execSQLLengthFieldFor does: a decoder needs the number, an encoder needs the
+// span.
 func execSQLLengthWideField(body []byte) (execSQLLenField, bool) {
 	const (
 		sentinelAt   = execWideSentinelAt
@@ -579,6 +607,70 @@ func execSQLLengthWideField(body []byte) (execSQLLenField, bool) {
 	}
 
 	return execSQLLenField{value: sqlLen, at: sqlLenAt, width: 4, kind: stmtLenWideUB4}, true
+}
+
+// execWide64SQLLenWidth is the width of the 64-bit OCI header's statement-length
+// field. It is fixed, like the 4-byte dialect's ub4, so re-encoding a longer
+// statement into it never shifts the bytes behind it.
+const execWide64SQLLenWidth = 8
+
+// execSQLLengthWide64Field reads the statement length out of the **64-bit** OCI
+// exec header — the twin of execSQLLengthWideField at this dialect's widths, and
+// the reading that was missing for as long as the tag never reached a 64-bit OCI
+// session.
+//
+// It validates the whole header shape rather than just the field, exactly as the
+// 4-byte reading does: the `00 00` pad where the other dialect puts
+// `[0x01][seq+1]`, the eight-byte "next sequence" that must be this frame's own
+// sequence plus one (usesWide64OpHeader's own guard, restated here because this
+// walk starts at an exec op that may be stapled behind a close list and so is not
+// the message's first byte), and the `fe x8` pointer sentinel in front of the
+// length. A payload that does not fit is refused outright; the caller never
+// falls back to another dialect's layout, because offering one session's bytes a
+// second layout to be mistaken for is how a run of zeros becomes a length. Same
+// rule, and the same reason, as execNoStatementCursorAt's.
+//
+// **The value is the plain byte count**, not `sqlLen * 3`. That is the one
+// difference from the 4-byte header that a widening of it would have missed, and
+// it is measured: `testdata/oci64_parse_execs.hex` declares 0x21 for the 33-byte
+// `BEGIN dbbat_cap_refcur(:rc); END;` in all three frames, with the same 33 as
+// the CLR short prefix immediately in front of the text. Reading it as a
+// buffered length would have handed the rewriter a third of the statement.
+func execSQLLengthWide64Field(body []byte) (execSQLLenField, bool) {
+	const (
+		sentinelAt = execWide64SentinelAt
+		sqlLenAt   = execWide64SQLLenAt
+	)
+
+	if len(body) < execWide64MinLen {
+		return execSQLLenField{}, false
+	}
+
+	if body[3] != 0x00 || body[4] != 0x00 {
+		return execSQLLenField{}, false
+	}
+
+	if binary.LittleEndian.Uint64(body[execWide64SeqPadAt:execWide64SeqPadAt+8]) != uint64(body[2])+1 {
+		return execSQLLenField{}, false
+	}
+
+	for i, b := range closeCursorsWideSentinel {
+		if body[sentinelAt+i] != b {
+			return execSQLLenField{}, false
+		}
+	}
+
+	declared := binary.LittleEndian.Uint64(body[sqlLenAt : sqlLenAt+execWide64SQLLenWidth])
+	if declared == 0 || declared > execMaxSQLLen {
+		return execSQLLenField{}, false
+	}
+
+	return execSQLLenField{
+		value: int(declared),
+		at:    sqlLenAt,
+		width: execWide64SQLLenWidth,
+		kind:  stmtLenWide64UB8,
+	}, true
 }
 
 // locateExecSQLText finds the statement of exactly sqlLen bytes inside an exec
